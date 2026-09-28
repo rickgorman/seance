@@ -9,6 +9,7 @@ use gpui::{
     SharedString, Window,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::Root;
 
 use super::colors::{self, ColorScheme, ImportResult};
 use super::preferences::{
@@ -296,31 +297,32 @@ impl Render for SettingsWindow {
             .bg(SeancePalette::bg())
             .text_color(SeancePalette::text())
             .track_focus(&self.focus_handle)
-            .capture_key_down(
-                cx.listener(|this, event: &gpui::KeyDownEvent, _window, cx| {
-                    if this.capture.is_some() || this.windows_capture.is_some() {
-                        if event.keystroke.key == "escape" {
-                            this.capture = None;
-                            this.windows_capture = None;
-                            this.bind_error = None;
-                            this.row_error = None;
-                            let weak = cx.weak_entity();
-                            window_hotkeys::WindowHotkeys::set_settings_recorder(
-                                cx, weak, None, None,
-                            );
-                            cx.notify();
-                            cx.stop_propagation();
-                            return;
-                        }
-                        let chord = preferences::keystroke_to_chord(&event.keystroke);
-                        if let Some(wcap) = this.windows_capture.clone() {
-                            this.complete_hotkey_capture(wcap, Some(chord), cx);
-                        }
+            .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                if settings_close_keystroke(event) {
+                    this.close_settings_window(window, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                if this.capture.is_some() || this.windows_capture.is_some() {
+                    if event.keystroke.key == "escape" {
+                        this.capture = None;
+                        this.windows_capture = None;
+                        this.bind_error = None;
+                        this.row_error = None;
+                        let weak = cx.weak_entity();
+                        window_hotkeys::WindowHotkeys::set_settings_recorder(cx, weak, None, None);
                         cx.notify();
                         cx.stop_propagation();
+                        return;
                     }
-                }),
-            )
+                    let chord = preferences::keystroke_to_chord(&event.keystroke);
+                    if let Some(wcap) = this.windows_capture.clone() {
+                        this.complete_hotkey_capture(wcap, Some(chord), cx);
+                    }
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+            }))
             .child(
                 div()
                     .flex_none()
@@ -431,6 +433,19 @@ fn error_banner(msg: String) -> gpui::AnyElement {
         .into_any_element()
 }
 
+/// Platform close-window chord (Cmd+W / Ctrl+W) — must win over hotkey capture and inputs.
+fn settings_close_keystroke(event: &gpui::KeyDownEvent) -> bool {
+    let key = event.keystroke.key.as_str();
+    if key != "w" {
+        return false;
+    }
+    if cfg!(target_os = "macos") {
+        event.keystroke.modifiers.platform
+    } else {
+        event.keystroke.modifiers.control
+    }
+}
+
 fn color_scheme_to_field_hex(scheme: &ColorScheme) -> Vec<String> {
     let mut out = vec![
         scheme.foreground.to_hex(),
@@ -476,6 +491,12 @@ fn tab_button(
 }
 
 impl SettingsWindow {
+    fn close_settings_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.clear_capture(cx);
+        clear_settings_window();
+        window.remove_window();
+    }
+
     fn clear_capture(&mut self, cx: &mut Context<Self>) {
         self.capture = None;
         self.windows_capture = None;
@@ -1312,13 +1333,20 @@ impl SeanceApp {
                 },
                 |window, cx| {
                     register_settings_window(window.window_handle());
-                    window.on_window_should_close(cx, |_, _| {
+                    let settings = cx.new(|cx| SettingsWindow::new(window, cx));
+                    let weak = settings.downgrade();
+                    window.on_window_should_close(cx, move |_, cx| {
                         clear_settings_window();
+                        window_hotkeys::WindowHotkeys::set_settings_recorder(
+                            cx,
+                            weak.clone(),
+                            None,
+                            None,
+                        );
                         true
                     });
-                    let settings = cx.new(|cx| SettingsWindow::new(window, cx));
                     window.focus(&settings.read(cx).focus_handle(cx), cx);
-                    settings
+                    cx.new(|cx| Root::new(settings, window, cx))
                 },
             )
             .expect("settings window");
