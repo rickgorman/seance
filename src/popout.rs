@@ -3,8 +3,11 @@
 //! The terminal entity is window-independent — popping out only moves where
 //! the `TerminalView` renders. The PTY keeps running across every move.
 
-use gpui::{div, prelude::*, px, Context, SharedString, WeakEntity, Window};
+use gpui::{
+    div, prelude::*, px, Context, FocusHandle, Focusable, SharedString, WeakEntity, Window,
+};
 
+use crate::app::preferences;
 use crate::app::SeanceApp;
 use crate::theme::SeancePalette;
 
@@ -15,6 +18,23 @@ pub struct PopoutView {
     pub name: String,
     pub view: gpui::AnyView,
     pub app: WeakEntity<SeanceApp>,
+    pub(crate) focus_handle: FocusHandle,
+}
+
+fn popout_action_is_allowed(action: preferences::AppAction) -> bool {
+    matches!(
+        action,
+        preferences::AppAction::TermZoomIn
+            | preferences::AppAction::TermZoomOut
+            | preferences::AppAction::TermZoomReset
+            | preferences::AppAction::OpenSettings
+    )
+}
+
+impl Focusable for PopoutView {
+    fn focus_handle(&self, _: &gpui::App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
 }
 
 impl Render for PopoutView {
@@ -25,6 +45,20 @@ impl Render for PopoutView {
             .flex()
             .flex_col()
             .bg(SeancePalette::bg())
+            .track_focus(&self.focus_handle)
+            .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                let mac = cfg!(target_os = "macos");
+                if let Some(action) = preferences::find_action_for_keystroke(&event.keystroke, mac)
+                    .filter(|action| popout_action_is_allowed(*action))
+                {
+                    if let Some(app) = this.app.upgrade() {
+                        app.update(cx, |app, cx| {
+                            app.dispatch_app_action(action, window, cx);
+                        });
+                        cx.stop_propagation();
+                    }
+                }
+            }))
             .child(
                 div()
                     .flex_none()
@@ -71,5 +105,21 @@ impl Render for PopoutView {
                     ),
             )
             .child(div().flex_1().overflow_hidden().child(self.view.clone()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::popout_action_is_allowed;
+    use crate::app::preferences::AppAction;
+
+    #[test]
+    fn only_popout_commands_cross_into_the_app() {
+        assert!(popout_action_is_allowed(AppAction::TermZoomIn));
+        assert!(popout_action_is_allowed(AppAction::TermZoomOut));
+        assert!(popout_action_is_allowed(AppAction::TermZoomReset));
+        assert!(popout_action_is_allowed(AppAction::OpenSettings));
+        assert!(!popout_action_is_allowed(AppAction::PaletteJump));
+        assert!(!popout_action_is_allowed(AppAction::CyclePaneNext));
     }
 }

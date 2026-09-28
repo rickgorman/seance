@@ -36,8 +36,10 @@ mod overview;
 mod pads;
 mod palette;
 mod prboard;
+pub(crate) mod preferences;
 mod prlinks;
 mod quicklaunch;
+mod settings;
 mod sidebar;
 mod tiles;
 mod util;
@@ -1483,6 +1485,17 @@ impl SeanceApp {
     ) {
         let ks = &event.keystroke;
         let key = ks.key.as_str();
+        let mac = cfg!(target_os = "macos");
+
+        // Settings is a recovery path: it must remain reachable even while a
+        // palette or another chrome overlay is swallowing input.
+        if preferences::find_action_for_keystroke(ks, mac)
+            == Some(preferences::AppAction::OpenSettings)
+        {
+            self.dispatch_app_action(preferences::AppAction::OpenSettings, window, cx);
+            cx.stop_propagation();
+            return;
+        }
 
         // ---- palette is open: own all keys until dismissed ----
         if !matches!(self.palette, PaletteMode::Closed) {
@@ -1608,147 +1621,9 @@ impl SeanceApp {
             return;
         }
 
-        // Every chrome chord below spells its modifier as ctrl, and as cmd too
-        // on macOS — see `chord_modifier_held`.
-        let chord_mod = chord_modifier_held(&ks.modifiers, cfg!(target_os = "macos"));
-
-        // Ctrl+PageUp/Down — cycle workspaces; Ctrl+Shift+Page — cycle panes.
-        // Accept pageup/pagedown (GPUI) and common aliases, plus the mac's
-        // cmd+arrow stand-in. Both cycles resolve before the chord table below,
-        // so on a mac cmd+shift+up/down cycles panes while spatial nav keeps
-        // ctrl+shift+arrows; left/right still fall through to spatial either way.
-        let paged = arrow_stands_in_for_page(key, &ks.modifiers, cfg!(target_os = "macos"));
-        let is_page_up = matches!(key, "pageup" | "page_up" | "prior")
-            || (paged && matches!(key, "up" | "arrowup"));
-        let is_page_down = matches!(key, "pagedown" | "page_down" | "next")
-            || (paged && matches!(key, "down" | "arrowdown"));
-        if chord_mod && !ks.modifiers.alt && (is_page_up || is_page_down) {
-            let delta = if is_page_up { -1 } else { 1 };
-            if ks.modifiers.shift {
-                self.cycle_pane(delta, window, cx);
-            } else {
-                self.cycle_workspace(delta, window, cx);
-            }
+        if let Some(action) = preferences::find_action_for_keystroke(ks, mac) {
+            self.dispatch_app_action(action, window, cx);
             cx.stop_propagation();
-            return;
-        }
-
-        if chord_mod && ks.modifiers.shift && !ks.modifiers.alt {
-            match key {
-                "n" => {
-                    self.new_default_session(cx);
-                    cx.stop_propagation();
-                }
-                "w" => {
-                    // Kill the active pane only. Last pane in a circle also
-                    // banishes the workspace (two presses for a 2-pane circle).
-                    // Empty selected circle (no panes) → banish the shell.
-                    if let Some(slug) = self.active_slug.clone() {
-                        let ws = self
-                            .panes
-                            .iter()
-                            .find(|p| p.slug == slug)
-                            .map(|p| p.workspace.clone());
-                        let last_in_ws = ws.as_ref().is_some_and(|w| {
-                            self.panes.iter().filter(|p| p.workspace == *w).count() == 1
-                        });
-                        if last_in_ws {
-                            if let Some(w) = ws {
-                                self.kill_workspace(&w, window, cx);
-                            }
-                        } else {
-                            self.kill_active_pane(cx);
-                        }
-                    } else if let Some(ws) = self.selected_workspace.clone() {
-                        if !self.panes.iter().any(|p| p.workspace == ws) {
-                            self.kill_workspace(&ws, window, cx);
-                        }
-                    }
-                    cx.stop_propagation();
-                }
-                "s" => {
-                    self.toggle_notes_flip(window, cx);
-                    cx.stop_propagation();
-                }
-                "p" => {
-                    // Pin/unpin the selected circle. Pane-level popout moved
-                    // to ctrl+shift+o — this key is about the rail now.
-                    if let Some(ws) = self.selected_workspace.clone() {
-                        self.toggle_pin_workspace(&ws);
-                        cx.notify();
-                        cx.stop_propagation();
-                    }
-                }
-                "o" => {
-                    if let Some(slug) = self.active_slug.clone() {
-                        self.toggle_popout(&slug, cx);
-                        cx.stop_propagation();
-                    }
-                }
-                "home" => {
-                    self.select_top_workspace(window, cx);
-                    cx.stop_propagation();
-                }
-                " " | "space" => {
-                    self.set_overview(!self.overview, cx);
-                    cx.stop_propagation();
-                }
-                "up" | "down" | "left" | "right" => {
-                    self.navigate_pane_directional(key, window, cx);
-                    cx.stop_propagation();
-                }
-                "k" => {
-                    self.palette = PaletteMode::Prompts {
-                        query: String::new(),
-                        selected: 0,
-                    };
-                    // Keep focus on root handle so typing is unambiguous even
-                    // if a child steals bubble; capture still owns keys.
-                    let fh = self.focus_handle.clone();
-                    window.focus(&fh, cx);
-                    cx.notify();
-                    cx.stop_propagation();
-                }
-                "j" => {
-                    self.palette = PaletteMode::Jump {
-                        query: String::new(),
-                        selected: 0,
-                    };
-                    let fh = self.focus_handle.clone();
-                    window.focus(&fh, cx);
-                    cx.notify();
-                    cx.stop_propagation();
-                }
-                "z" | "m" => {
-                    if let Some(slug) = self.active_slug.clone() {
-                        self.toggle_zoom(&slug, cx);
-                        cx.stop_propagation();
-                    }
-                }
-                "r" => {
-                    // Inline-rename the selected workspace; Enter commits and
-                    // returns focus to the pane that was active.
-                    if let Some(ws) = self.selected_workspace.clone() {
-                        let label = self.workspace_label(&ws);
-                        self.start_rename(RenameTarget::Workspace(ws.clone()), &label, window, cx);
-                        cx.stop_propagation();
-                    }
-                }
-                "f" => {
-                    if let Some(slug) = self.active_slug.clone() {
-                        self.show_last_failed(&slug, cx);
-                        cx.stop_propagation();
-                    }
-                }
-                // ctrl+shift+1..9 — nth row of the rail, counted the way you
-                // read it (1 is the same jump as home).
-                k => {
-                    if let Some(idx) = rail_index_for_key(k) {
-                        self.select_nth_workspace(idx, window, cx);
-                        cx.stop_propagation();
-                    }
-                }
-            }
         }
     }
 
@@ -2306,11 +2181,12 @@ impl SeanceApp {
                     }
                     true
                 });
-                let popout = cx.new(|_| crate::popout::PopoutView {
+                let popout = cx.new(|cx| crate::popout::PopoutView {
                     slug: slug_owned.clone(),
                     name: pane_name.clone(),
                     view: view.clone(),
                     app: app.clone(),
+                    focus_handle: cx.focus_handle(),
                 });
                 cx.new(|cx| gpui_component::Root::new(popout, window, cx))
             },

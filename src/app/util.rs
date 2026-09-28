@@ -227,6 +227,7 @@ pub(super) fn telegram_status_bridge(
 /// on macOS (it's the copy/paste chord there), so no TUI loses a key. Linux is
 /// excluded on purpose — `platform` is super there, and super+<key> is the
 /// window manager's.
+#[allow(dead_code)] // mac cmd-as-mod semantics; cycle defaults live in preferences.rs
 pub(super) fn chord_modifier_held(mods: &gpui::Modifiers, mac: bool) -> bool {
     mods.control || (mac && mods.platform)
 }
@@ -235,6 +236,7 @@ pub(super) fn chord_modifier_held(mods: &gpui::Modifiers, mac: bool) -> bool {
 /// in for them and the circle / pane cycles stay reachable. Cmd-only on
 /// purpose: `ctrl+shift+arrows` is spatial pane nav and bare `ctrl+arrows` is a
 /// PTY sequence, so neither is available to borrow.
+#[allow(dead_code)]
 pub(super) fn arrow_stands_in_for_page(key: &str, mods: &gpui::Modifiers, mac: bool) -> bool {
     mac && mods.platform && !mods.control && matches!(key, "up" | "arrowup" | "down" | "arrowdown")
 }
@@ -243,6 +245,7 @@ pub(super) fn arrow_stands_in_for_page(key: &str, mods: &gpui::Modifiers, mac: b
 /// shifted symbol: the compositor reports one or the other depending on how it
 /// resolves the shift, and a chord that works on one machine and silently does
 /// nothing on the next is worse than no chord.
+#[allow(dead_code)] // digit normalization tests; rail jumps use preferences actions now.
 pub(super) fn rail_index_for_key(key: &str) -> Option<usize> {
     let digit = match key {
         "1" | "!" => 1,

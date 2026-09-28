@@ -1079,6 +1079,15 @@ pub(super) fn render_help() -> gpui::AnyElement {
              nav stays on ctrl+shift+arrows",
         ))
         .child(row("escape", "dismiss whisper / palette / unzoom"))
+        .child(section("settings (device-local)"))
+        .child(row(
+            "ctrl+, (macOS: cmd+,)",
+            "open settings — terminal font, global shortcuts, persistence in ~/.config/seance/desktop.json",
+        ))
+        .child(row(
+            "ctrl+0 / ctrl+− / ctrl+= (macOS: cmd)",
+            "reset / shrink / grow terminal text size (8–32px; chrome unchanged)",
+        ))
         .child(section("terminal focus"))
         .child(row("ctrl+shift+c / v", "copy selection / paste (macOS: cmd+c / cmd+v)"))
         .child(row("shift+pgup/pgdn", "scrollback"))

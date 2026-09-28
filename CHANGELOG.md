@@ -19,6 +19,10 @@ Unreleased work can sit under `## [Unreleased]` until the version bump.
 
 ### Added
 
+- Desktop settings window (sidebar ⚙ or ctrl+, / cmd+,): pick an installed
+  monospace terminal font and size, remap global app shortcuts with conflict
+  checks, and persist choices in `~/.config/seance/desktop.json`. Terminal
+  text zoom: ctrl/cmd + − / = / 0.
 - `seance --help`, `seance -h`, and `seance help` show the control-plane CLI
   help without opening a desktop window or connecting to a daemon.
 - Drag the desktop sidebar's right edge to resize it; its width persists.
@@ -28,6 +32,8 @@ Unreleased work can sit under `## [Unreleased]` until the version bump.
 
 ### Fixed
 
+- Terminal paint is clipped to each pane's canvas bounds (overview thumbnails
+  too), stopping glyph bleed into the gutter on resize.
 - Split panes now share only the space left after the divider, keeping
   terminal content inside its pane. Sidebar timestamps sit closer to names.
 - Terminal panes on stock macOS (no JetBrains Nerd Font installed) now use an

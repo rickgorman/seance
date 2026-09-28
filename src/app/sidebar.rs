@@ -859,6 +859,7 @@ impl SeanceApp {
                             div()
                                 .flex_none()
                                 .text_xs()
+                                .font_weight(gpui::FontWeight::NORMAL)
                                 .whitespace_nowrap()
                                 .text_color(if selected {
                                     SeancePalette::text_dim()
@@ -1117,6 +1118,26 @@ impl SeanceApp {
                             }))
                             .tooltip(tip("activity feed — who did what, live"))
                             .child("≋"),
+                    )
+                    .child(
+                        div()
+                            .id("settings")
+                            .flex_none()
+                            .px_3()
+                            .py_1p5()
+                            .rounded_md()
+                            .flex()
+                            .items_center()
+                            .text_sm()
+                            .text_color(SeancePalette::text_dim())
+                            .bg(SeancePalette::surface())
+                            .hover(|s| s.bg(SeancePalette::border()))
+                            .cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.open_settings_window(cx);
+                            }))
+                            .tooltip(tip("settings — font, shortcuts (ctrl+,)"))
+                            .child("⚙"),
                     )
                     .child(
                         div()

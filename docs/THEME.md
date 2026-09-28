@@ -77,9 +77,10 @@ runtime cost (`#[inline]`, trivial arithmetic).
 Call order in `main`: `gpui_component::init(cx)` → **`theme::init(cx)`** →
 open window.
 
-`init()` does four steps (see `src/theme.rs::init`); step 4 is font-family
-hygiene on non-macOS — pick the first installed sans/mono rather than letting
-gpui probe, which is load-bearing for typing latency:
+`init()` does four steps (see `src/theme.rs::init`); it also loads
+`desktop.json` terminal font/size into `term_font` before windows open. Step 4
+is font-family hygiene on non-macOS — pick the first installed sans/mono rather
+than letting gpui probe, which is load-bearing for typing latency:
 
 1. **`Theme::change(ThemeMode::Dark, None, cx)`** — activates dark mode.
    `Theme::change` lazily creates the `Theme` global if absent and calls

@@ -43,7 +43,10 @@ splits). That crisis throttle is gone — if it's on screen, it runs live.
 - **Shaped paint cache** — re-paint without reshape when grid/bounds unchanged
   (sidebar DnD forces full `window.refresh` every move; cache keeps it cheap).
 - Resize hysteresis (no col 120↔121 thrash).
-- `Arc` snapshots; cached cell metrics (shape ASCII `M` once in the selected monospace font).
+- `Arc` snapshots; cached cell metrics keyed by font revision/family/size
+  (shape ASCII `M` in the user-selected monospace face from `desktop.json`).
+- Shaped-run and paint-replay caches include font revision so equal-width
+  faces do not reuse stale glyphs after a font switch.
 - **Local echo** for printable keys on focus (daemon frame wins by rev).
 - **Typing hot** (`src/term_shared.rs`) — a human keystroke marks the app hot
   for 250ms; applied grids paint immediately while hot, ~30fps otherwise

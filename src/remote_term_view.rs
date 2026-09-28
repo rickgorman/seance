@@ -10,15 +10,16 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use gpui::{
-    canvas, div, fill, point, prelude::*, px, App, Bounds, Context, FocusHandle, Focusable, Hsla,
-    KeyDownEvent, Pixels, Point, ScrollWheelEvent, ShapedLine, SharedString, TextRun, Window,
+    canvas, div, fill, point, prelude::*, px, App, Bounds, ContentMask, Context, FocusHandle,
+    Focusable, Hsla, KeyDownEvent, Pixels, Point, ScrollWheelEvent, ShapedLine, SharedString,
+    TextRun, Window,
 };
 use gpui_component::{notification::Notification, WindowExt as _};
 
 use crate::clipboard::{cap_copy_len, copied_toast, copy_text_to_clipboard};
 use crate::remote_term::RemoteTerminal;
 use crate::runtime::snapshot::{CellSnap, GridSnapshot};
-use crate::term_font::{self, term_font, term_font_bold, FONT_SIZE, LINE_HEIGHT_FACTOR};
+use crate::term_font::{self, font_size, term_font, term_font_bold, LINE_HEIGHT_FACTOR};
 use crate::term_shared::keystroke_bytes;
 use crate::theme::SeancePalette;
 use alacritty_terminal::term::TermMode;
@@ -592,7 +593,7 @@ impl RemoteTerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let line_height = px(FONT_SIZE * LINE_HEIGHT_FACTOR);
+        let line_height = px(font_size() * LINE_HEIGHT_FACTOR);
         self.scroll_accum +=
             f32::from(event.delta.pixel_delta(line_height).y) / f32::from(line_height);
         let lines = self.scroll_accum.trunc() as i32;
@@ -760,7 +761,8 @@ impl Render for RemoteTerminalView {
                                 bounds,
                                 cell_w,
                                 line_h,
-                                font_size: px(FONT_SIZE),
+                                font_size: px(font_size()),
+                                font_rev: term_font::revision(),
                                 snap,
                                 ghost_text: ghost.map(|g| g.text),
                                 input_origin,
@@ -769,7 +771,7 @@ impl Render for RemoteTerminalView {
                             }
                         }
                     },
-                    |_bounds, layout: Layout, window, cx| {
+                    |bounds, layout: Layout, window, cx| {
                         // Persist metrics so mouse handlers can map coords.
                         // Stored via a side channel keyed by slug (view state
                         // isn't reachable from paint closure without Entity).
@@ -783,7 +785,9 @@ impl Render for RemoteTerminalView {
                                 rows: layout.snap.rows,
                             },
                         );
-                        paint_grid(&layout, window, cx);
+                        window.with_content_mask(Some(ContentMask { bounds }), |window| {
+                            paint_grid(&layout, window, cx);
+                        });
                     },
                 )
                 .size_full(),
@@ -871,7 +875,8 @@ impl Render for OverviewThumb {
                             size: gpui::size(px(grid_w), px(grid_h)),
                         };
                         // Font tracks scale so glyphs stay inside cells.
-                        let font_size = px((FONT_SIZE * scale).clamp(6.0, FONT_SIZE));
+                        let fs = font_size();
+                        let font_size = px((fs * scale).clamp(6.0, fs));
                         Layout {
                             // Separate cache key from the live full-size view.
                             // Include scale+scroll so crop pans invalidate cache.
@@ -880,6 +885,7 @@ impl Render for OverviewThumb {
                             cell_w,
                             line_h,
                             font_size,
+                            font_rev: term_font::revision(),
                             snap,
                             ghost_text: ghost.map(|g| g.text),
                             input_origin,
@@ -887,8 +893,10 @@ impl Render for OverviewThumb {
                             origin_gutter: false,
                         }
                     },
-                    |_bounds, layout: Layout, window, cx| {
-                        paint_grid(&layout, window, cx);
+                    |bounds, layout: Layout, window, cx| {
+                        window.with_content_mask(Some(ContentMask { bounds }), |window| {
+                            paint_grid(&layout, window, cx);
+                        });
                     },
                 )
                 .size_full(),
@@ -902,6 +910,7 @@ struct Layout {
     cell_w: Pixels,
     line_h: Pixels,
     font_size: Pixels,
+    font_rev: u64,
     snap: Arc<crate::runtime::snapshot::GridSnapshot>,
     ghost_text: Option<String>,
     /// Causal tint: who last wrote stdin.
@@ -940,6 +949,7 @@ fn load_metrics(slug: &str) -> Option<ViewMetrics> {
 #[derive(Clone)]
 struct ShapedPaintCache {
     rev: u64,
+    font_rev: u64,
     origin_x: f32,
     origin_y: f32,
     width: f32,
@@ -979,6 +989,7 @@ fn shaped_paint_caches() -> &'static Mutex<HashMap<String, ShapedPaintCache>> {
 
 fn cache_matches(c: &ShapedPaintCache, layout: &Layout) -> bool {
     c.rev == layout.snap.rev
+        && c.font_rev == layout.font_rev
         && c.origin_x == f32::from(layout.bounds.origin.x)
         && c.origin_y == f32::from(layout.bounds.origin.y)
         && c.width == f32::from(layout.bounds.size.width)
@@ -1051,16 +1062,22 @@ struct TextBatch {
     style: Style,
 }
 
-/// Measure mono cell size once per process (font is fixed for the app).
+/// Measure mono cell size; cached per font revision + family + size.
 fn cell_metrics(window: &mut Window) -> (Pixels, Pixels) {
-    use std::sync::OnceLock;
-    static CACHED: OnceLock<(f32, f32)> = OnceLock::new();
-    if let Some(&(w, h)) = CACHED.get() {
-        return (px(w), px(h));
+    static CACHED: Mutex<Option<(u64, String, f32, f32, f32)>> = Mutex::new(None);
+    let rev = term_font::revision();
+    let family = term_font::family();
+    let size = font_size();
+    if let Ok(guard) = CACHED.lock() {
+        if let Some((cr, cf, cs, w, h)) = guard.as_ref() {
+            if *cr == rev && *cf == family && *cs == size {
+                return (px(*w), px(*h));
+            }
+        }
     }
     let probe = window.text_system().shape_line(
         SharedString::from("M"),
-        px(FONT_SIZE),
+        px(size),
         &[TextRun {
             len: 'M'.len_utf8(),
             font: term_font(),
@@ -1072,9 +1089,21 @@ fn cell_metrics(window: &mut Window) -> (Pixels, Pixels) {
         None,
     );
     let w = f32::from(probe.width);
-    let h = FONT_SIZE * LINE_HEIGHT_FACTOR;
-    let _ = CACHED.set((w, h));
+    let h = size * LINE_HEIGHT_FACTOR;
+    if let Ok(mut guard) = CACHED.lock() {
+        *guard = Some((rev, family, size, w, h));
+    }
     (px(w), px(h))
+}
+
+/// Clears shaped-run and paint replay caches after a font change.
+pub fn invalidate_terminal_caches() {
+    if let Ok(mut g) = shaped_paint_caches().lock() {
+        g.clear();
+    }
+    if let Some(cache) = SHAPE_CACHE.get() {
+        cache.lock().unwrap().clear();
+    }
 }
 
 fn term_default_fg() -> Hsla {
@@ -1141,12 +1170,14 @@ fn shape_run_cached(
     b: &TextBatch,
     font_size: Pixels,
     cell_w: Pixels,
+    font_rev: u64,
     window: &mut Window,
 ) -> ShapedLine {
     use std::hash::{Hash as _, Hasher as _};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     b.text.hash(&mut h);
     b.style.bold.hash(&mut h);
+    font_rev.hash(&mut h);
     // Hsla isn't Hash; bit-hash the components.
     let c = b.style.fg;
     for f in [c.h, c.s, c.l, c.a, f32::from(cell_w), f32::from(font_size)] {
@@ -1362,7 +1393,7 @@ fn paint_grid(layout: &Layout, window: &mut Window, cx: &mut App) {
     let font_size = layout.font_size;
     let mut cache_texts: Vec<(f32, f32, ShapedLine)> = Vec::with_capacity(batches.len());
     for b in &batches {
-        let shaped = shape_run_cached(b, font_size, layout.cell_w, window);
+        let shaped = shape_run_cached(b, font_size, layout.cell_w, layout.font_rev, window);
         let pos = point(
             origin.x + layout.cell_w * b.start_col as f32,
             origin.y + layout.line_h * b.row as f32,
@@ -1412,6 +1443,7 @@ fn paint_grid(layout: &Layout, window: &mut Window, cx: &mut App) {
             layout.slug.clone(),
             ShapedPaintCache {
                 rev: layout.snap.rev,
+                font_rev: layout.font_rev,
                 origin_x: f32::from(origin.x),
                 origin_y: f32::from(origin.y),
                 width: f32::from(layout.bounds.size.width),
@@ -1617,5 +1649,64 @@ mod tests {
         // gesture was explicit, so the length doesn't get a vote.
         assert!(copies_on_release(SelectKind::Word, 1));
         assert!(copies_on_release(SelectKind::Lines, 1));
+    }
+
+    fn sample_paint_layout(font_rev: u64) -> Layout {
+        let mut snap = GridSnapshot::empty("pane");
+        snap.rev = 7;
+        snap.cols = 80;
+        snap.rows = 24;
+        Layout {
+            slug: "pane".into(),
+            bounds: Bounds {
+                origin: point(px(10.), px(20.)),
+                size: gpui::size(px(800.), px(480.)),
+            },
+            cell_w: px(10.),
+            line_h: px(20.),
+            font_size: px(12.),
+            font_rev,
+            snap: Arc::new(snap),
+            ghost_text: None,
+            input_origin: None,
+            selection: None,
+            origin_gutter: false,
+        }
+    }
+
+    fn shaped_cache_for_layout(layout: &Layout) -> ShapedPaintCache {
+        ShapedPaintCache {
+            rev: layout.snap.rev,
+            font_rev: layout.font_rev,
+            origin_x: f32::from(layout.bounds.origin.x),
+            origin_y: f32::from(layout.bounds.origin.y),
+            width: f32::from(layout.bounds.size.width),
+            height: f32::from(layout.bounds.size.height),
+            cell_w: f32::from(layout.cell_w),
+            line_h: f32::from(layout.line_h),
+            font_size: f32::from(layout.font_size),
+            ghost: layout.ghost_text.clone(),
+            input_origin: layout.input_origin.clone(),
+            selection_key: selection_key(&layout.selection, layout.snap.cols, layout.snap.rows),
+            rects: Vec::new(),
+            texts: Vec::new(),
+            cursor: (10., 20., 10., 20.),
+            ghost_shaped: None,
+        }
+    }
+
+    #[test]
+    fn shaped_paint_cache_replays_when_font_rev_matches() {
+        let layout = sample_paint_layout(3);
+        let cache = shaped_cache_for_layout(&layout);
+        assert!(cache_matches(&cache, &layout));
+    }
+
+    #[test]
+    fn shaped_paint_cache_misses_when_only_font_rev_changes() {
+        let layout = sample_paint_layout(3);
+        let cache = shaped_cache_for_layout(&layout);
+        let after_font_change = sample_paint_layout(4);
+        assert!(!cache_matches(&cache, &after_font_change));
     }
 }

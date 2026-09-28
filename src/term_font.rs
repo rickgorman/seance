@@ -6,17 +6,19 @@
 //! The primary family is chosen from the host font inventory at startup (see
 //! [`init`]); `FontFallbacks` only cover missing glyphs in that face, not a
 //! missing primary family (GPUI falls back to `.ZedMono`/etc. instead).
+//!
+//! Family and pixel size are mutable via [`apply_appearance`] (desktop prefs).
 
 use std::collections::HashSet;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{OnceLock, RwLock};
 
 use gpui::{font, Font, FontFeatures, SharedString};
 
 /// Preferred family when installed (ghostty fc-match on the reference host).
 pub const FONT_FAMILY: &str = "JetBrainsMono Nerd Font";
 
-/// Ghostty uses 9; we keep a slightly larger default for multi-pane grids.
-/// Still the same face — only the size differs for readability.
+/// Default terminal size (desktop prefs may override).
 pub const FONT_SIZE: f32 = 12.0;
 
 /// Tight line height so half-blocks stack cleanly (ghostty-ish).
@@ -31,13 +33,48 @@ const FONT_CANDIDATES: &[&str] = &[
     "Noto Sans Mono",
 ];
 
-static RESOLVED_FAMILY: OnceLock<String> = OnceLock::new();
+struct Appearance {
+    family: String,
+    size: f32,
+}
+
+static APPEARANCE: OnceLock<RwLock<Appearance>> = OnceLock::new();
+static REVISION: AtomicU64 = AtomicU64::new(0);
+
+fn appearance() -> &'static RwLock<Appearance> {
+    APPEARANCE.get_or_init(|| {
+        RwLock::new(Appearance {
+            family: FONT_FAMILY.to_string(),
+            size: FONT_SIZE,
+        })
+    })
+}
+
+/// Bumps whenever family or size changes — cache keys must include this.
+pub fn revision() -> u64 {
+    REVISION.load(Ordering::SeqCst)
+}
+
+pub fn font_size() -> f32 {
+    appearance().read().map(|a| a.size).unwrap_or(FONT_SIZE)
+}
+
+pub fn family() -> String {
+    appearance()
+        .read()
+        .map(|a| a.family.clone())
+        .unwrap_or_else(|_| FONT_FAMILY.to_string())
+}
 
 /// Pick and cache the terminal primary family from `installed` (from
 /// `TextSystem::all_font_names`). Call once from [`crate::theme::init`] before
-/// any windows open.
+/// any windows open; desktop prefs may override immediately after.
 pub fn init(installed: &HashSet<String>) {
-    let _ = RESOLVED_FAMILY.set(select_installed_term_family(installed));
+    let family = select_installed_term_family(installed);
+    let _ = APPEARANCE.set(RwLock::new(Appearance {
+        family,
+        size: FONT_SIZE,
+    }));
 }
 
 /// First installed candidate in priority order, else the preferred name.
@@ -49,14 +86,21 @@ pub(crate) fn select_installed_term_family(installed: &HashSet<String>) -> Strin
         .unwrap_or_else(|| FONT_FAMILY.to_string())
 }
 
-fn resolved_family() -> &'static str {
-    RESOLVED_FAMILY
-        .get()
-        .map(|s| s.as_str())
-        .unwrap_or(FONT_FAMILY)
+pub fn apply_appearance(family: &str, size: f32) {
+    let mut a = match appearance().write() {
+        Ok(guard) => guard,
+        Err(_) => return,
+    };
+    if a.family == family && a.size == size {
+        return;
+    }
+    a.family = family.to_string();
+    a.size = size;
+    REVISION.fetch_add(1, Ordering::SeqCst);
+    crate::remote_term_view::invalidate_terminal_caches();
 }
 
-fn term_font_for_family(family: &str) -> Font {
+pub fn term_font_for_family(family: &str) -> Font {
     Font {
         family: SharedString::from(family),
         features: FontFeatures(std::sync::Arc::new(vec![
@@ -79,7 +123,7 @@ fn term_font_for_family(family: &str) -> Font {
 
 /// Terminal font with ligatures disabled (matches ghostty's -liga/-calt).
 pub fn term_font() -> Font {
-    term_font_for_family(resolved_family())
+    term_font_for_family(&family())
 }
 
 pub fn term_font_bold() -> Font {
@@ -89,7 +133,32 @@ pub fn term_font_bold() -> Font {
 /// Convenience when only family is needed (legacy call sites).
 #[allow(dead_code)]
 pub fn term_font_plain() -> Font {
-    font(resolved_family())
+    font(family())
+}
+
+/// True when `family` resolves to itself and renders M/i/W/0/space at equal advance.
+pub fn probe_monospace(text_system: &gpui::TextSystem, family: &str, size: f32) -> bool {
+    use gpui::px;
+    let font = term_font_for_family(family);
+    let font_id = text_system.resolve_font(&font);
+    let resolved = text_system
+        .get_font_for_id(font_id)
+        .map(|f| f.family.to_string());
+    if resolved.as_deref() != Some(family) {
+        return false;
+    }
+    let mut widths = Vec::new();
+    for sample in ['M', 'i', 'W', '0', ' '] {
+        let adv = text_system
+            .advance(font_id, px(size), sample)
+            .map(|s| f32::from(s.width))
+            .unwrap_or(f32::NAN);
+        widths.push(adv);
+    }
+    let w0 = widths[0];
+    widths
+        .iter()
+        .all(|w| w.is_finite() && *w > 0. && (*w - w0).abs() < 0.05)
 }
 
 #[cfg(test)]

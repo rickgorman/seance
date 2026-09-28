@@ -143,6 +143,12 @@ against a remote daemon; keep new code portable (use `sysopen.rs`, never
 rule 4. The web client (`crates/seance-web`) is a third client on the same
 protocol and the same invariant: it has no filesystem at all.
 
+**Desktop presentation exception:** `~/.config/seance/desktop.json` (or
+`$XDG_CONFIG_HOME/seance/desktop.json`) holds **device-local** GUI prefs only —
+installed terminal font/size and global keyboard chords. Loaded/saved in the
+GUI process (atomic writes, background save thread); never touches the daemon
+or remote workspace files.
+
 ## Module conventions (the split's contract — follow it)
 
 - Child modules of `app/` and `engine/` hold `impl SeanceApp` / `impl Engine`

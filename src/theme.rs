@@ -141,6 +141,7 @@ pub fn init(cx: &mut App) {
     let installed_fonts: std::collections::HashSet<String> =
         cx.text_system().all_font_names().into_iter().collect();
     crate::term_font::init(&installed_fonts);
+    crate::app::preferences::init(&installed_fonts, cx.text_system());
     let theme = Theme::global_mut(cx);
 
     // 2. Overwrite ThemeColor fields with the candlelit palette. `theme` derefs
