@@ -553,7 +553,6 @@ pub(super) fn render_pane(
         // min-content — terminal cols / long markdown lines). Soft floor
         // keeps a sliver of chrome visible without pinning panes wide.
         .min_w(px(48.))
-        .w_full()
         .overflow_hidden()
         .flex()
         .flex_col()

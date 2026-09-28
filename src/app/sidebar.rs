@@ -11,13 +11,12 @@ use crate::runtime::protocol::GuiRequest;
 use crate::theme::SeancePalette;
 use seance_core::grouping::{Section, SectionRow};
 
-/// Rail metrics. One left axis and one right edge: every glyph slot, every
-/// name, and every time/count line up regardless of row kind.
+/// Rail metrics. Names share a left axis; timestamps follow each name.
 const ROW_H: f32 = 28.;
 /// Glyph column — fixed so a row with no glyph still starts its name on the
 /// same line as one that has a spinner.
 const GLYPH_W: f32 = 15.;
-/// Time / count column, right-aligned.
+/// Cluster count column, right-aligned.
 const TIME_W: f32 = 34.;
 /// How far a cluster's members sit inside their header.
 const CLUSTER_INDENT: f32 = 14.;
@@ -675,6 +674,7 @@ impl SeanceApp {
             div()
                 .id(SharedString::from(format!("ws-{workspace}")))
                 .group(SharedString::from(format!("wsgrp-{workspace}")))
+                .relative()
                 .h(px(ROW_H))
                 .pr_2()
                 // 3px of the left inset is the selection anchor, so the text
@@ -811,11 +811,18 @@ impl SeanceApp {
                         },
                         false => (String::new(), label.clone()),
                     };
+                    let att = if selected {
+                        None
+                    } else {
+                        attention.filter(|a| matches!(a, WorkspaceAttention::Done))
+                    };
                     div()
                         .flex_1()
                         .min_w_0()
+                        .pr_5()
                         .flex()
                         .items_center()
+                        .gap_1()
                         .text_sm()
                         .font_weight(if selected {
                             gpui::FontWeight::SEMIBOLD
@@ -837,31 +844,34 @@ impl SeanceApp {
                                 .text_color(name_color)
                                 .child(tail),
                         )
-                })
-                .children({
-                    // `done` is worth a mark but not a shout; `needs` already
-                    // owns the glyph and the name colour, so it needs no pill.
-                    let att = if selected {
-                        None
-                    } else {
-                        attention.filter(|a| matches!(a, WorkspaceAttention::Done))
-                    };
-                    att.map(|a| {
-                        div()
-                            .flex_none()
-                            .px_1()
-                            .rounded_sm()
-                            .text_xs()
-                            .bg(a.color().opacity(0.14))
-                            .text_color(a.color())
-                            .child(a.label())
-                    })
+                        .children(att.map(|a| {
+                            div()
+                                .flex_none()
+                                .px_1()
+                                .rounded_sm()
+                                .text_xs()
+                                .bg(a.color().opacity(0.14))
+                                .text_color(a.color())
+                                .child(a.label())
+                        }))
+                        .child({
+                            let label = self.workspace_activity_label(&workspace);
+                            div()
+                                .flex_none()
+                                .text_xs()
+                                .whitespace_nowrap()
+                                .text_color(if selected {
+                                    SeancePalette::text_dim()
+                                } else {
+                                    SeancePalette::text_faint()
+                                })
+                                .child(label.unwrap_or_default())
+                        })
                 })
                 .child({
-                    // Banish ×: revealed only while the row is hovered
-                    // (group-hover), so idle rows stay quiet. A first click
-                    // only arms it — armed, it names the damage ("banish? 3")
-                    // and stays lit until a second click or BANISH_ARM.
+                    // Banish × overlays the row's right edge — not in the flex
+                    // flow between name and time, so idle rows don't reserve a
+                    // blank gutter for it.
                     let armed = banish_arm_live(
                         self.banish_armed.as_ref(),
                         &workspace,
@@ -873,59 +883,52 @@ impl SeanceApp {
                         .filter(|p| p.workspace == workspace)
                         .count();
                     div()
-                        .id(SharedString::from(format!("ws-banish-{workspace}")))
-                        .flex_none()
-                        .px_1()
-                        .rounded_sm()
-                        .text_xs()
-                        .when(!armed, |d| {
-                            d.text_color(gpui::transparent_black()).group_hover(
-                                SharedString::from(format!("wsgrp-{workspace}")),
-                                |s| s.text_color(SeancePalette::text_faint()),
-                            )
-                        })
-                        .when(armed, |d| {
-                            d.text_color(SeancePalette::danger())
-                                .bg(SeancePalette::surface())
-                        })
-                        .hover(|s| {
-                            s.text_color(SeancePalette::danger())
-                                .bg(SeancePalette::surface())
-                        })
-                        .cursor_pointer()
-                        .on_click({
-                            let ws = workspace.clone();
-                            cx.listener(move |this, _, window, cx| {
-                                this.banish_click(&ws, window, cx);
-                            })
-                        })
-                        .tooltip(tip(if armed {
-                            "click again to banish — kills every pane in this circle"
-                        } else {
-                            "banish workspace (kill all panes)"
-                        }))
-                        .child(if armed {
-                            format!("banish? {panes}")
-                        } else {
-                            "×".to_string()
-                        })
-                })
-                .child({
-                    // Fixed width, right-aligned — headers put their counts in
-                    // the same column, so the whole rail has one hard right
-                    // edge instead of a ragged gutter.
-                    let label = self.workspace_activity_label(&workspace);
-                    div()
-                        .flex_none()
-                        .w(px(TIME_W))
-                        .text_xs()
-                        .text_right()
-                        .text_color(if selected {
-                            SeancePalette::text_dim()
-                        } else {
-                            SeancePalette::text_faint()
-                        })
-                        .child(label.unwrap_or_default())
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .h_full()
+                        .pr_2()
+                        .flex()
+                        .items_center()
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("ws-banish-{workspace}")))
+                                .flex_none()
+                                .px_1()
+                                .rounded_sm()
+                                .text_xs()
+                                .when(!armed, |d| {
+                                    d.text_color(gpui::transparent_black()).group_hover(
+                                        SharedString::from(format!("wsgrp-{workspace}")),
+                                        |s| s.text_color(SeancePalette::text_faint()),
+                                    )
+                                })
+                                .when(armed, |d| {
+                                    d.text_color(SeancePalette::danger())
+                                        .bg(SeancePalette::surface())
+                                })
+                                .hover(|s| {
+                                    s.text_color(SeancePalette::danger())
+                                        .bg(SeancePalette::surface())
+                                })
+                                .cursor_pointer()
+                                .on_click({
+                                    let ws = workspace.clone();
+                                    cx.listener(move |this, _, window, cx| {
+                                        this.banish_click(&ws, window, cx);
+                                    })
+                                })
+                                .tooltip(tip(if armed {
+                                    "click again to banish — kills every pane in this circle"
+                                } else {
+                                    "banish workspace (kill all panes)"
+                                }))
+                                .child(if armed {
+                                    format!("banish? {panes}")
+                                } else {
+                                    "×".to_string()
+                                }),
+                        )
                 })
                 .into_any_element()
         };

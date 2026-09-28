@@ -28,6 +28,8 @@ Unreleased work can sit under `## [Unreleased]` until the version bump.
 
 ### Fixed
 
+- Split panes now share only the space left after the divider, keeping
+  terminal content inside its pane. Sidebar timestamps sit closer to names.
 - Terminal panes on stock macOS (no JetBrains Nerd Font installed) now use an
   installed monospace primary face (Menlo) instead of GPUI's default fallback
   stack, fixing uneven letter spacing while keeping the Nerd Font when present.

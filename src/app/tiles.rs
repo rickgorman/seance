@@ -2,7 +2,7 @@
 //! resizable sashes (2-pane split, multi-pane horizontal pairs, inter-row
 //! vertical sashes), plus focus-zoom (single pane fills the region).
 
-use gpui::{div, prelude::*, px, relative, Context, SharedString, Window};
+use gpui::{div, prelude::*, px, Context, SharedString, Window};
 
 use crate::pane::Pane;
 use crate::theme::SeancePalette;
@@ -302,8 +302,8 @@ impl SeanceApp {
             let left = tiled[0];
             let right = tiled[1];
             let ratio = self.split_ratio.clamp(0.2, 0.8);
-            let left_pct = (ratio * 100.0) as u32;
-            let right_pct = 100 - left_pct;
+            let left_w = ratio;
+            let right_w = 1.0 - ratio;
             let flipped_l = self
                 .flipped
                 .as_ref()
@@ -332,7 +332,9 @@ impl SeanceApp {
                         .min_h_0()
                         .overflow_hidden()
                         .flex()
-                        .w(relative(left_pct as f32 / 100.0))
+                        .flex_col()
+                        .flex_basis(px(0.))
+                        .flex_grow(left_w)
                         .child(render_pane(
                             left,
                             active.as_deref(),
@@ -369,7 +371,9 @@ impl SeanceApp {
                         .min_h_0()
                         .overflow_hidden()
                         .flex()
-                        .w(relative(right_pct as f32 / 100.0))
+                        .flex_col()
+                        .flex_basis(px(0.))
+                        .flex_grow(right_w)
                         .child(render_pane(
                             right,
                             active.as_deref(),
@@ -456,6 +460,8 @@ impl SeanceApp {
                         .min_h_0()
                         .overflow_hidden()
                         .flex()
+                        .flex_col()
+                        .flex_basis(px(0.))
                         .flex_grow(w)
                         .child(render_pane(
                             pane,
