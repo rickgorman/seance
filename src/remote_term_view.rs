@@ -1059,10 +1059,10 @@ fn cell_metrics(window: &mut Window) -> (Pixels, Pixels) {
         return (px(w), px(h));
     }
     let probe = window.text_system().shape_line(
-        SharedString::from("█"),
+        SharedString::from("M"),
         px(FONT_SIZE),
         &[TextRun {
-            len: '█'.len_utf8(),
+            len: 'M'.len_utf8(),
             font: term_font(),
             color: term_default_fg(),
             background_color: None,
