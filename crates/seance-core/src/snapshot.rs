@@ -41,10 +41,11 @@ pub struct CellSnap {
     /// Glyph. Omitted when space (the common case).
     #[serde(default = "default_space", skip_serializing_if = "is_space")]
     pub c: char,
-    /// Packed RGB (0x00RRGGBB). 0xFFFFFFFF = default fg.
+    /// Packed RGB, a semantic palette reference (see `terminal_color`), or
+    /// 0xFFFFFFFF for the default foreground. Palette references use SCG3 v2.
     #[serde(default = "default_color", skip_serializing_if = "is_default_color")]
     pub fg: u32,
-    /// Packed RGB. 0xFFFFFFFF = default bg (transparent).
+    /// Packed RGB or a semantic palette reference. 0xFFFFFFFF = default bg.
     #[serde(default = "default_color", skip_serializing_if = "is_default_color")]
     pub bg: u32,
     #[serde(default, skip_serializing_if = "is_false")]
@@ -159,7 +160,7 @@ pub struct GridSnapshot {
     #[serde(default, skip_serializing_if = "is_false")]
     pub sgr_mouse: bool,
     /// Who last wrote stdin to this PTY (`human` / `agent:x` / `cli` / `propose`).
-    /// Carried on JSON grid path; binary path also embeds it (SCG3 v2).
+    /// Carried on JSON grid path only (not in the SCG3 binary header today).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_input_origin: Option<String>,
     /// OSC-8 hyperlink spans on the visible screen (row/col are 0-based cell coords).
@@ -231,7 +232,8 @@ const MAGIC: &[u8; 4] = b"SCG3";
 /// pure container: the frame inside is an ordinary SCG3 frame, so the recorder
 /// and the frozen-pane store keep writing (and reading) raw SCG3.
 const MAGIC_Z: &[u8; 4] = b"SCZ3";
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
+const VERSION_MIN: u8 = 1;
 const FRAME_FULL: u8 = 0;
 const FRAME_DAMAGE: u8 = 1;
 const FRAME_SCROLL: u8 = 2;
@@ -639,7 +641,7 @@ pub fn decode_grid_bin_onto(
         return Err("bad magic".into());
     }
     let ver = r.read_u8()?;
-    if ver != VERSION {
+    if ver < VERSION_MIN || ver > VERSION {
         return Err(format!("unsupported SCG version {ver}"));
     }
     let rev = r.read_u64()?;
@@ -683,13 +685,13 @@ pub fn decode_grid_bin_onto(
     let mut full_authoritative_links = false;
     let cells = if legacy {
         // SCG2: implicit full RLE of all cells
-        read_rle_n(&mut r, expect)?
+        read_rle_n(&mut r, expect, ver)?
     } else {
         let kind = r.read_u8()?;
         match kind {
             FRAME_FULL => {
                 full_authoritative_links = true;
-                read_rle_n(&mut r, expect)?
+                read_rle_n(&mut r, expect, ver)?
             }
             FRAME_DAMAGE | FRAME_SCROLL => {
                 let base = base.ok_or_else(|| "damage frame without base".to_string())?;
@@ -710,7 +712,7 @@ pub fn decode_grid_bin_onto(
                     if row >= rows as usize {
                         return Err(format!("damage row {row} oob"));
                     }
-                    let row_cells = read_rle_n(&mut r, cols as usize)?;
+                    let row_cells = read_rle_n(&mut r, cols as usize, ver)?;
                     let start = row * cols as usize;
                     cells[start..start + cols as usize].clone_from_slice(&row_cells);
                 }
@@ -827,7 +829,7 @@ fn write_rle(out: &mut Vec<u8>, cells: &[CellSnap]) -> Result<(), String> {
     Ok(())
 }
 
-fn read_rle_n(r: &mut Reader<'_>, n: usize) -> Result<Vec<CellSnap>, String> {
+fn read_rle_n(r: &mut Reader<'_>, n: usize, wire_ver: u8) -> Result<Vec<CellSnap>, String> {
     let mut cells = Vec::with_capacity(n);
     while cells.len() < n {
         if r.is_empty() {
@@ -839,10 +841,10 @@ fn read_rle_n(r: &mut Reader<'_>, n: usize) -> Result<Vec<CellSnap>, String> {
                 let k = r.read_u16()? as usize;
                 cells.resize(cells.len() + k, CellSnap::blank());
             }
-            OP_CELL => cells.push(read_cell(r)?),
+            OP_CELL => cells.push(read_cell(r, wire_ver)?),
             OP_REPEAT => {
                 let k = r.read_u16()? as usize;
-                let cell = read_cell(r)?;
+                let cell = read_cell(r, wire_ver)?;
                 cells.resize(cells.len() + k, cell);
             }
             other => return Err(format!("bad RLE op {other:#x}")),
@@ -850,6 +852,18 @@ fn read_rle_n(r: &mut Reader<'_>, n: usize) -> Result<Vec<CellSnap>, String> {
     }
     cells.resize(n, CellSnap::blank());
     Ok(cells)
+}
+
+/// SCG v1 stored only default sentinel or 24-bit RGB; reject tag-shaped payloads.
+fn validate_v1_wire_color(c: u32) -> Result<u32, String> {
+    use crate::terminal_color::DEFAULT_COLOR;
+    if c == DEFAULT_COLOR {
+        return Ok(c);
+    }
+    if c & 0xFF_00_00_00 != 0 {
+        return Err(format!("invalid SCG v1 color {c:#010x}"));
+    }
+    Ok(c)
 }
 
 fn write_str(out: &mut Vec<u8>, s: &str) -> Result<(), String> {
@@ -870,11 +884,16 @@ fn write_cell(out: &mut Vec<u8>, c: &CellSnap) {
     out.push(c.style_byte());
 }
 
-fn read_cell(r: &mut Reader<'_>) -> Result<CellSnap, String> {
+fn read_cell(r: &mut Reader<'_>, wire_ver: u8) -> Result<CellSnap, String> {
     let ch = char::from_u32(r.read_u32()?).unwrap_or(' ');
     let fg = r.read_u32()?;
     let bg = r.read_u32()?;
     let style = r.read_u8()?;
+    let (fg, bg) = if wire_ver == VERSION_MIN {
+        (validate_v1_wire_color(fg)?, validate_v1_wire_color(bg)?)
+    } else {
+        (fg, bg)
+    };
     Ok(CellSnap::from_parts(ch, fg, bg, style))
 }
 
@@ -1247,5 +1266,82 @@ mod bin_tests {
         bad.extend_from_slice(&u32::MAX.to_le_bytes());
         bad.extend_from_slice(&[0u8; 8]);
         assert!(decode_grid_bin(&bad).is_err());
+    }
+
+    #[test]
+    fn scg3_v2_emits_version_and_roundtrips_tags() {
+        use crate::terminal_color::encode_index;
+
+        let mut s = sample();
+        s.cells[0].fg = encode_index(3, false);
+        s.cells[0].bg = encode_index(48, true);
+        let bin = encode_grid_bin(&s).unwrap();
+        assert_eq!(bin[4], VERSION);
+        let d = decode_grid_bin(&bin).unwrap();
+        assert_eq!(d.cells[0].fg, encode_index(3, false));
+        assert_eq!(d.cells[0].bg, encode_index(48, true));
+    }
+
+    #[test]
+    fn scg3_v1_frames_keep_historical_rgb_bytes() {
+        let mut s = sample();
+        s.cells[0].fg = 0x00_02_03_04;
+        let bin = encode_grid_bin(&s).unwrap();
+        let mut v1 = bin.clone();
+        v1[4] = VERSION_MIN;
+        let d = decode_grid_bin(&v1).unwrap();
+        assert_eq!(d.cells[0].fg, 0x00_02_03_04);
+    }
+
+    #[test]
+    fn scg3_v1_rejects_tag_shaped_color_payloads() {
+        let mut s = sample();
+        s.cells[0].fg = 0x01_00_00_01;
+        let bin = encode_grid_bin(&s).unwrap();
+        let mut v1 = bin.clone();
+        v1[4] = VERSION_MIN;
+        assert!(decode_grid_bin(&v1).is_err());
+    }
+
+    #[test]
+    fn v2_tagged_damage_and_scroll_on_v1_rgb_base() {
+        use crate::terminal_color::encode_index;
+
+        let mut base = sample();
+        base.cells[80].fg = 0x00_ab_46_42;
+        let mut next = base.clone();
+        next.rev = 99;
+        next.cells[80].fg = encode_index(1, false);
+        let dirty = dirty_rows(&base.cells, &next.cells, 80, 3);
+        let bin = encode_grid_bin_ex(&next, Some(&dirty)).unwrap();
+        let d = decode_grid_bin_onto(&bin, Some(&base)).unwrap();
+        assert_eq!(d.cells[80].fg, encode_index(1, false));
+
+        let scroll_base = base.clone();
+        let mut scroll_next = scroll_base.clone();
+        scroll_next.rev = 100;
+        scroll_next.cells[0].c = 'Q';
+        let delta = 1i16;
+        let dmg = vec![0u16];
+        let bin =
+            encode_grid_bin_spec(&scroll_next, FrameSpec::Scroll { delta, rows: &dmg }).unwrap();
+        let got = decode_grid_bin_onto(&bin, Some(&scroll_base)).unwrap();
+        assert_eq!(got.cells[0].c, 'Q');
+    }
+
+    #[test]
+    fn scz3_wraps_v2_tagged_cells() {
+        use crate::terminal_color::encode_index;
+
+        let mut s = sample();
+        s.cells[1].fg = encode_index(9, false);
+        let raw = encode_grid_bin(&s).unwrap();
+        assert_eq!(raw[4], VERSION);
+        let z = compress_frame(raw.clone());
+        assert_ne!(z, raw);
+        assert_eq!(
+            decode_grid_bin(&z).unwrap().cells[1].fg,
+            encode_index(9, false)
+        );
     }
 }

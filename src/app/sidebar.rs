@@ -1023,22 +1023,27 @@ impl SeanceApp {
                             .font_semibold()
                             .child("seance"),
                     )
-                    .child(
-                        div()
-                            .id("new-workspace")
-                            .flex_none()
-                            .px_1p5()
-                            .rounded_md()
-                            .text_xs()
-                            .text_color(SeancePalette::violet_dim())
-                            .hover(|s| s.text_color(SeancePalette::violet()).bg(SeancePalette::surface()))
-                            .cursor_pointer()
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.create_workspace(window, cx);
-                            }))
-                            .tooltip(tip("new empty workspace (name it immediately)"))
-                            .child("◈+"),
-                    ),
+                    .when(self.window_scope.fixed_workspace().is_none(), |d| {
+                        d.child(
+                            div()
+                                .id("new-workspace")
+                                .flex_none()
+                                .px_1p5()
+                                .rounded_md()
+                                .text_xs()
+                                .text_color(SeancePalette::violet_dim())
+                                .hover(|s| {
+                                    s.text_color(SeancePalette::violet())
+                                        .bg(SeancePalette::surface())
+                                })
+                                .cursor_pointer()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.create_workspace(window, cx);
+                                }))
+                                .tooltip(tip("new empty workspace (name it immediately)"))
+                                .child("◈+"),
+                        )
+                    }),
             )
             .child({
                 // Workspace list only — context menus live on *rows*, not the scroller.

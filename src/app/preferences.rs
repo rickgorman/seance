@@ -10,6 +10,8 @@ use std::sync::{Mutex, OnceLock, RwLock};
 use gpui::Keystroke;
 use serde::{Deserialize, Serialize};
 
+use super::colors::{self, ColorScheme};
+
 pub const FONT_SIZE_DEFAULT: f32 = 12.0;
 pub const FONT_SIZE_MIN: f32 = 8.0;
 pub const FONT_SIZE_MAX: f32 = 32.0;
@@ -178,6 +180,14 @@ impl Chord {
     }
 }
 
+/// One OS window dedicated to a single workspace slug.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceWindowDefinition {
+    pub workspace: String,
+    #[serde(default)]
+    pub shortcut: Option<Chord>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DesktopPrefs {
     #[serde(default = "default_font_family")]
@@ -187,6 +197,15 @@ pub struct DesktopPrefs {
     /// Per-action override chords. Absent → built-in defaults.
     #[serde(default)]
     pub shortcuts: HashMap<String, Vec<Chord>>,
+    /// System-wide show/hide for the primary Seance window (macOS).
+    #[serde(default)]
+    pub main_window_hotkey: Option<Chord>,
+    /// Additional workspace-tied OS windows.
+    #[serde(default)]
+    pub workspace_windows: Vec<WorkspaceWindowDefinition>,
+    /// Terminal ANSI / default colors for native panes (device-local).
+    #[serde(default)]
+    pub terminal_color_scheme: ColorScheme,
 }
 
 fn default_font_family() -> String {
@@ -203,6 +222,9 @@ impl Default for DesktopPrefs {
             font_family: default_font_family(),
             font_size: FONT_SIZE_DEFAULT,
             shortcuts: HashMap::new(),
+            main_window_hotkey: None,
+            workspace_windows: Vec::new(),
+            terminal_color_scheme: ColorScheme::default(),
         }
     }
 }
@@ -248,7 +270,7 @@ pub fn normalize_chord(chord: &Chord) -> Chord {
     }
 }
 
-fn make_chord(ctrl: bool, meta: bool, shift: bool, key: &str) -> Chord {
+pub(crate) fn make_chord(ctrl: bool, meta: bool, shift: bool, key: &str) -> Chord {
     Chord {
         ctrl,
         alt: false,
@@ -596,6 +618,62 @@ pub enum BindError {
     Protected,
     UnsafeBareKey,
     Conflict(AppAction),
+    ConflictWindowHotkey,
+}
+
+pub fn schedule_desktop_save() {
+    schedule_save();
+}
+
+fn all_window_hotkey_chords(prefs: &DesktopPrefs) -> Vec<Chord> {
+    let mut out = Vec::new();
+    if let Some(c) = prefs.main_window_hotkey.clone() {
+        out.push(normalize_chord(&c));
+    }
+    for def in &prefs.workspace_windows {
+        if let Some(c) = def.shortcut.clone() {
+            out.push(normalize_chord(&c));
+        }
+    }
+    out
+}
+
+pub fn validate_window_hotkey_candidate(
+    prefs: &DesktopPrefs,
+    chord: &Chord,
+    skip_workspace_index: Option<usize>,
+    mac: bool,
+) -> Result<(), BindError> {
+    let c = normalize_chord(chord);
+    if !chord_is_safe_global(&c) {
+        return Err(BindError::UnsafeBareKey);
+    }
+    if is_protected_chord(&c, mac) {
+        return Err(BindError::Protected);
+    }
+    for action in AppAction::all_global() {
+        for ac in chords_for_action(prefs, *action) {
+            if normalize_chord(&ac) == c {
+                return Err(BindError::Conflict(*action));
+            }
+        }
+    }
+    if let Some(main) = prefs.main_window_hotkey.as_ref() {
+        if normalize_chord(main) == c {
+            return Err(BindError::ConflictWindowHotkey);
+        }
+    }
+    for (i, def) in prefs.workspace_windows.iter().enumerate() {
+        if skip_workspace_index == Some(i) {
+            continue;
+        }
+        if let Some(sc) = def.shortcut.as_ref() {
+            if normalize_chord(sc) == c {
+                return Err(BindError::ConflictWindowHotkey);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_effective_shortcuts(
@@ -639,6 +717,15 @@ fn validate_effective_shortcuts(
             seen.push((*action, chord));
         }
     }
+    for wh in all_window_hotkey_chords(&effective) {
+        for action in AppAction::all_global() {
+            for chord in chords_for_action(&effective, *action) {
+                if normalize_chord(&chord) == wh {
+                    return Err(BindError::Conflict(*action));
+                }
+            }
+        }
+    }
     Ok(normalized)
 }
 
@@ -651,6 +738,9 @@ pub fn validate_bind(
     let normalized = dedup_chords(chords.into_iter().map(|c| normalize_chord(&c)));
     if action == AppAction::OpenSettings {
         return Err(BindError::Protected);
+    }
+    for chord in &normalized {
+        validate_window_hotkey_candidate(prefs, chord, None, mac)?;
     }
     let mut candidate = prefs.shortcuts.clone();
     if normalized.is_empty() {
@@ -693,6 +783,11 @@ pub fn reset_action_in_prefs(
             return Err(BindError::Conflict(*other));
         }
     }
+    for wh in all_window_hotkey_chords(prefs) {
+        if defaults.iter().any(|d| normalize_chord(d) == wh) {
+            return Err(BindError::ConflictWindowHotkey);
+        }
+    }
     let mut candidate = prefs.shortcuts.clone();
     candidate.remove(&action_key(action));
     prefs.shortcuts = validate_effective_shortcuts(&candidate, mac)?;
@@ -708,10 +803,32 @@ pub fn reset_action(action: AppAction) -> Result<(), BindError> {
     result
 }
 
-pub fn reset_all_shortcuts() {
+pub fn reset_all_shortcuts_in_prefs(
+    prefs: &DesktopPrefs,
+    mac: bool,
+) -> Result<HashMap<String, Vec<Chord>>, BindError> {
+    let validated = validate_effective_shortcuts(&HashMap::new(), mac)?;
+    let mut trial = prefs.clone();
+    trial.shortcuts = validated.clone();
+    for wh in all_window_hotkey_chords(&trial) {
+        for action in AppAction::all_global() {
+            for chord in chords_for_action(&trial, *action) {
+                if normalize_chord(&chord) == wh {
+                    return Err(BindError::ConflictWindowHotkey);
+                }
+            }
+        }
+    }
+    Ok(validated)
+}
+
+pub fn reset_all_shortcuts() -> Result<(), BindError> {
+    let mac = cfg!(target_os = "macos");
     let mut prefs = desktop_prefs().write().unwrap();
-    prefs.shortcuts.clear();
+    let validated = reset_all_shortcuts_in_prefs(&prefs, mac)?;
+    prefs.shortcuts = validated;
     schedule_save();
+    Ok(())
 }
 
 pub fn parse_prefs_json(
@@ -779,6 +896,7 @@ pub fn init(installed: &HashSet<String>, text_system: &gpui::TextSystem) {
     let prefs = load_from_disk(installed, Some(text_system));
     let _ = DESKTOP.set(RwLock::new(prefs.clone()));
     crate::term_font::apply_appearance(&prefs.font_family, prefs.font_size);
+    colors::init_applied_palette(&prefs.terminal_color_scheme);
     spawn_save_thread();
 }
 
@@ -823,6 +941,22 @@ pub fn apply_font_from_settings(family: String, size: f32, installed: &HashSet<S
     prefs.font_family = family;
     prefs.font_size = clamp_font_size(size);
     crate::term_font::apply_appearance(&prefs.font_family, prefs.font_size);
+    schedule_save();
+}
+
+pub fn apply_color_scheme_from_settings(scheme: ColorScheme) -> Result<(), String> {
+    let mut prefs = desktop_prefs().write().unwrap();
+    prefs.terminal_color_scheme = scheme.clone();
+    colors::apply_palette(scheme);
+    schedule_save();
+    Ok(())
+}
+
+pub fn reset_color_scheme_defaults() {
+    let scheme = ColorScheme::default();
+    let mut prefs = desktop_prefs().write().unwrap();
+    prefs.terminal_color_scheme = scheme.clone();
+    colors::apply_palette(scheme);
     schedule_save();
 }
 
@@ -911,6 +1045,22 @@ mod tests {
         let json = serde_json::to_string(&prefs).unwrap();
         let back: DesktopPrefs = serde_json::from_str(&json).unwrap();
         assert_eq!(back.font_size, FONT_SIZE_DEFAULT);
+        assert!(back.main_window_hotkey.is_none());
+        assert!(back.workspace_windows.is_empty());
+    }
+
+    #[test]
+    fn window_hotkey_fields_roundtrip_in_json() {
+        let mut prefs = DesktopPrefs::default();
+        prefs.main_window_hotkey = Some(make_chord(false, true, false, "m"));
+        prefs.workspace_windows.push(WorkspaceWindowDefinition {
+            workspace: "nuance".into(),
+            shortcut: Some(make_chord(false, true, true, "n")),
+        });
+        let json = serde_json::to_string(&prefs).unwrap();
+        let back: DesktopPrefs = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.main_window_hotkey, prefs.main_window_hotkey);
+        assert_eq!(back.workspace_windows, prefs.workspace_windows);
     }
 
     #[test]
@@ -977,6 +1127,33 @@ mod tests {
         let chords = chords_for_action(&prefs, AppAction::NewSession);
         assert_eq!(chords, custom);
         assert!(!chords.iter().any(|c| c.key == "n"));
+    }
+
+    #[test]
+    fn reset_all_refuses_when_window_hotkey_uses_freed_default() {
+        let mac = cfg!(target_os = "macos");
+        let mut prefs = DesktopPrefs::default();
+        let default_new = default_chords(AppAction::NewSession)[0].clone();
+        prefs
+            .shortcuts
+            .insert(action_key(AppAction::NewSession), vec![shift_chord("x")]);
+        prefs.main_window_hotkey = Some(default_new);
+        assert!(matches!(
+            reset_all_shortcuts_in_prefs(&prefs, mac),
+            Err(BindError::ConflictWindowHotkey)
+        ));
+    }
+
+    #[test]
+    fn window_hotkey_conflicts_with_app_shortcut() {
+        let mac = cfg!(target_os = "macos");
+        let mut prefs = DesktopPrefs::default();
+        let chord = default_chords(AppAction::NewSession)[0].clone();
+        prefs.main_window_hotkey = Some(chord.clone());
+        assert!(matches!(
+            validate_window_hotkey_candidate(&prefs, &chord, None, mac),
+            Err(BindError::Conflict(AppAction::NewSession))
+        ));
     }
 
     #[test]
@@ -1226,5 +1403,15 @@ mod tests {
             key: ",".into(),
         };
         assert!(c.display(true).contains("cmd"));
+    }
+
+    #[test]
+    fn terminal_color_scheme_roundtrips_in_desktop_json() {
+        let mut prefs = DesktopPrefs::default();
+        prefs.terminal_color_scheme.background = colors::Rgb24::from_hex("#222222").unwrap();
+        let json = serde_json::to_string(&prefs).unwrap();
+        let installed: HashSet<String> = HashSet::new();
+        let back = parse_prefs_json(&json, &installed, None);
+        assert_eq!(back.terminal_color_scheme.background.to_hex(), "#222222");
     }
 }

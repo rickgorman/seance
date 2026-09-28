@@ -3,11 +3,11 @@
 use std::io::{BufRead, BufReader, IoSlice, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context as _, Result};
 
@@ -46,6 +46,19 @@ fn run_daemon_inner(args: Vec<String>) -> Result<()> {
         .find(|w| w[0] == "--takeover")
         .map(|w| PathBuf::from(&w[1]));
     let is_takeover = takeover.is_some();
+
+    let pid_path = daemon_pid_path();
+    if let Some(dir) = pid_path.parent() {
+        std::fs::create_dir_all(dir).context("create daemon PID directory")?;
+    }
+    // Takeover publishes its pid before handoff so `ensure_daemon` won't cold-
+    // spawn a duplicate while the control socket is still absent.
+    if is_takeover {
+        std::fs::write(&pid_path, format!("{}\n", std::process::id()))
+            .context("publish takeover daemon PID before handoff")?;
+    } else {
+        guard_cold_daemon_start(&control::bind_socket_path(), &pid_path)?;
+    }
 
     let (engine, event_rx) = if let Some(ref handoff_sock) = takeover {
         eprintln!("[seance daemon] takeover from {}", handoff_sock.display());
@@ -124,11 +137,6 @@ fn run_daemon_inner(args: Vec<String>) -> Result<()> {
     // Idle circles stop holding RAM (12h; restorable circles only).
     sleepsweep::start_sleep_sweeper(Arc::clone(&engine));
 
-    // Write pid file.
-    let pid_path = daemon_pid_path();
-    if let Some(dir) = pid_path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
     let _ = std::fs::write(&pid_path, format!("{}\n", std::process::id()));
 
     let sock_path = control::bind_socket_path();
@@ -232,6 +240,7 @@ fn handle_connection(stream: UnixStream, engine: SharedEngine) -> Result<()> {
             // GUI or CLI asked this daemon to upgrade itself.
             serve_upgrade_request(writer, engine)
         }
+        "ready" => serve_daemon_ready(writer),
         other => {
             let _ = writeln!(
                 writer,
@@ -849,14 +858,254 @@ fn daemon_log_file() -> Option<std::fs::File> {
     Some(file)
 }
 
+/// Max wait for a post-upgrade daemon to answer `role: ready` with the expected pid.
+const UPGRADE_READY_DEADLINE: Duration = Duration::from_secs(30);
+/// Max wait for an initializing daemon to bind its control socket.
+const ENSURE_SOCKET_DEADLINE: Duration = Duration::from_secs(30);
+const PROBE_IO_TIMEOUT: Duration = Duration::from_millis(500);
+
+fn serve_daemon_ready(mut writer: UnixStream) -> Result<()> {
+    let line = serde_json::json!({
+        "ok": true,
+        "pid": std::process::id(),
+        "version": env!("CARGO_PKG_VERSION"),
+    });
+    writeln!(writer, "{line}")?;
+    writer.flush()?;
+    Ok(())
+}
+
+/// Parse `daemon.pid` contents; rejects 0/1 and garbage.
+fn parse_daemon_pid_file_text(text: &str) -> Option<u32> {
+    let pid = text.trim().parse::<u32>().ok()?;
+    if pid > 1 {
+        Some(pid)
+    } else {
+        None
+    }
+}
+
+fn read_daemon_pid_file(path: &Path) -> Option<u32> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| parse_daemon_pid_file_text(&s))
+}
+
+fn cmdline_is_seance_daemon(cmdline: &str) -> bool {
+    let mut args = cmdline.split_whitespace();
+    if args.next().and_then(|arg| Path::new(arg).file_name())
+        != Some(std::ffi::OsStr::new("seance"))
+    {
+        return false;
+    }
+    while let Some(arg) = args.next() {
+        if arg == "--takeover" {
+            args.next();
+            continue;
+        }
+        if !arg.starts_with('-') {
+            return arg == "daemon";
+        }
+    }
+    false
+}
+
+/// True when `pid` is a live `seance daemon` process (not a recycled unrelated pid).
+fn is_live_seance_daemon(pid: u32) -> bool {
+    if !process_is_running(pid) {
+        return false;
+    }
+    let cmd = crate::sysopen::process_cmdline(pid);
+    if cmd.is_empty() {
+        return false;
+    }
+    cmdline_is_seance_daemon(&cmd)
+}
+
+fn process_is_running(pid: u32) -> bool {
+    if pid <= 1 || pid > i32::MAX as u32 {
+        return false;
+    }
+    // SAFETY: signal 0 only tests existence; no signal is delivered.
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+fn control_socket_accepts(path: &Path) -> bool {
+    path.exists() && UnixStream::connect(path).is_ok()
+}
+
+/// Refuse a cold `seance daemon` when another owner is live or still starting.
+fn guard_cold_daemon_start(sock_path: &Path, pid_path: &Path) -> Result<()> {
+    if let Some(pid) = read_daemon_pid_file(pid_path) {
+        if is_live_seance_daemon(pid) {
+            bail!(
+                "seance daemon pid {pid} is still running (control socket not ready yet) — \
+                 wait for upgrade/handoff to finish instead of starting another"
+            );
+        }
+        let _ = std::fs::remove_file(pid_path);
+    }
+    if sock_path.exists() {
+        if UnixStream::connect(sock_path).is_ok() {
+            bail!(
+                "another seance daemon is already listening at {}",
+                sock_path.display()
+            );
+        }
+        let _ = std::fs::remove_file(sock_path);
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadyProbeOutcome {
+    Matched,
+    WrongPid { got: u32 },
+    WrongVersion,
+    NotReady,
+    Malformed,
+    Closed,
+}
+
+fn evaluate_ready_response(line: &str, expected_pid: u32, version: &str) -> ReadyProbeOutcome {
+    let v: serde_json::Value = match serde_json::from_str(line.trim()) {
+        Ok(v) => v,
+        Err(_) => return ReadyProbeOutcome::Malformed,
+    };
+    if v.get("ok").and_then(|x| x.as_bool()) != Some(true) {
+        return ReadyProbeOutcome::NotReady;
+    }
+    let got_pid = v
+        .get("pid")
+        .and_then(|x| x.as_u64())
+        .and_then(|p| u32::try_from(p).ok())
+        .filter(|p| *p > 1);
+    let got_ver = v.get("version").and_then(|x| x.as_str());
+    match (got_pid, got_ver) {
+        (Some(pid), Some(ver)) if ver == version && pid == expected_pid => {
+            ReadyProbeOutcome::Matched
+        }
+        (Some(pid), Some(_)) if pid != expected_pid => ReadyProbeOutcome::WrongPid { got: pid },
+        (Some(_), Some(ver)) if ver != version => ReadyProbeOutcome::WrongVersion,
+        _ => ReadyProbeOutcome::Malformed,
+    }
+}
+
+fn probe_daemon_ready(sock_path: &Path, expected_pid: u32, version: &str) -> ReadyProbeOutcome {
+    let mut stream = match UnixStream::connect(sock_path) {
+        Ok(s) => s,
+        Err(_) => return ReadyProbeOutcome::NotReady,
+    };
+    let _ = stream.set_read_timeout(Some(PROBE_IO_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(PROBE_IO_TIMEOUT));
+    if writeln!(stream, r#"{{"role":"ready"}}"#).is_err() {
+        return ReadyProbeOutcome::NotReady;
+    }
+    if stream.flush().is_err() {
+        return ReadyProbeOutcome::NotReady;
+    }
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    match reader.read_line(&mut line) {
+        Ok(0) => ReadyProbeOutcome::Closed,
+        Ok(_) => evaluate_ready_response(&line, expected_pid, version),
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => ReadyProbeOutcome::NotReady,
+        Err(_) if line.is_empty() => ReadyProbeOutcome::Closed,
+        Err(_) => ReadyProbeOutcome::NotReady,
+    }
+}
+
+fn wait_for_daemon_ready(
+    sock_path: &Path,
+    expected_pid: u32,
+    version: &str,
+    deadline: Duration,
+) -> Result<()> {
+    let until = Instant::now() + deadline;
+    while Instant::now() < until {
+        if !process_is_running(expected_pid) {
+            bail!("replacement daemon pid {expected_pid} exited before becoming ready; check daemon-upgrade.log");
+        }
+        match probe_daemon_ready(sock_path, expected_pid, version) {
+            ReadyProbeOutcome::Matched => {
+                eprintln!("[seance] upgraded daemon ready (pid {expected_pid}, version {version})");
+                return Ok(());
+            }
+            ReadyProbeOutcome::WrongPid { got } => {
+                eprintln!(
+                    "[seance] upgrade readiness: socket answered pid {got}, still waiting for {expected_pid}"
+                );
+            }
+            ReadyProbeOutcome::WrongVersion => {
+                bail!(
+                    "replacement daemon pid {expected_pid} reported a version other than {version}"
+                );
+            }
+            // An old listener can close or truncate its reply during teardown.
+            ReadyProbeOutcome::NotReady
+            | ReadyProbeOutcome::Malformed
+            | ReadyProbeOutcome::Closed => {}
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    bail!(
+        "upgraded daemon pid {expected_pid} did not become ready within {deadline:?} \
+         (still listening on old process? check daemon-upgrade.log)"
+    );
+}
+
+fn wait_for_control_socket(sock_path: &Path, deadline: Duration) -> Result<()> {
+    let until = Instant::now() + deadline;
+    while Instant::now() < until {
+        if control_socket_accepts(sock_path) {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    bail!("control socket did not become ready within {deadline:?}");
+}
+
+/// Pure decision for `ensure_daemon`: never cold-spawn while a live owner is initializing.
+fn ensure_daemon_spawn_decision(
+    socket_live: bool,
+    pid_file_pid: Option<u32>,
+    pid_is_live_daemon: bool,
+) -> Result<bool> {
+    if socket_live {
+        return Ok(false);
+    }
+    if let Some(pid) = pid_file_pid {
+        if pid_is_live_daemon {
+            bail!(
+                "seance daemon pid {pid} is running but the control socket is not ready yet — \
+                 wait for handoff instead of spawning another"
+            );
+        }
+    }
+    Ok(true)
+}
+
 /// Ensure a daemon is running; spawn one if needed. Returns true if we spawned.
 pub fn ensure_daemon() -> Result<bool> {
     let path = control::socket_path();
-    if path.exists() {
-        if UnixStream::connect(&path).is_ok() {
+    let socket_live = control_socket_accepts(&path);
+    let pid_path = daemon_pid_path();
+    let pid_file_pid = read_daemon_pid_file(&pid_path);
+    let pid_is_live = pid_file_pid.map(is_live_seance_daemon).unwrap_or(false);
+    match ensure_daemon_spawn_decision(socket_live, pid_file_pid, pid_is_live) {
+        Ok(false) => return Ok(false),
+        Err(waiting) => {
+            wait_for_control_socket(&path, ENSURE_SOCKET_DEADLINE)
+                .with_context(|| waiting.to_string())?;
             return Ok(false);
         }
+        Ok(true) => {}
+    }
+    if path.exists() {
         let _ = std::fs::remove_file(&path);
+    }
+    if pid_file_pid.is_some() && !pid_is_live {
+        let _ = std::fs::remove_file(&pid_path);
     }
     let bin = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(bin);
@@ -885,14 +1134,8 @@ pub fn ensure_daemon() -> Result<bool> {
         }
     }
     cmd.spawn().context("spawn seance daemon")?;
-    // Wait for socket.
-    for _ in 0..100 {
-        if path.exists() && UnixStream::connect(&path).is_ok() {
-            return Ok(true);
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    bail!("daemon did not become ready");
+    wait_for_control_socket(&path, ENSURE_SOCKET_DEADLINE).context("spawned daemon")?;
+    Ok(true)
 }
 
 /// Ask the live daemon to upgrade to this binary.
@@ -968,14 +1211,162 @@ pub fn request_upgrade() -> Result<()> {
             .unwrap_or("unknown upgrade failure");
         bail!("{err}");
     }
-    // Wait for new daemon to bind the control socket (handoff can lag).
-    for _ in 0..100 {
-        if UnixStream::connect(control::socket_path()).is_ok() {
-            // Brief settle so first ctl/GUI attach doesn't race empty accept.
-            thread::sleep(Duration::from_millis(50));
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(50));
+    let expected_pid = v
+        .get("pid")
+        .and_then(|x| x.as_u64())
+        .and_then(|p| u32::try_from(p).ok())
+        .filter(|p| *p > 1)
+        .context("upgrade response missing valid pid")?;
+    let sock = control::socket_path();
+    wait_for_daemon_ready(
+        &sock,
+        expected_pid,
+        env!("CARGO_PKG_VERSION"),
+        UPGRADE_READY_DEADLINE,
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::*;
+    use std::io::{BufRead, Write};
+    use std::sync::mpsc;
+
+    fn spawn_ready_listener(
+        sock_path: &Path,
+        reply: &str,
+    ) -> (thread::JoinHandle<()>, mpsc::Receiver<()>) {
+        let path = sock_path.to_path_buf();
+        let body = reply.to_string();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let _ = std::fs::remove_file(&path);
+            let listener = UnixListener::bind(&path).expect("bind test socket");
+            ready_tx.send(()).ok();
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut line = String::new();
+                let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+                let _ = reader.read_line(&mut line);
+                let _ = writeln!(stream, "{body}");
+                let _ = stream.flush();
+            }
+        });
+        ready_rx.recv().expect("listener bound");
+        (handle, ready_rx)
     }
-    bail!("upgraded daemon did not become ready on control socket");
+
+    #[test]
+    fn ready_probe_rejects_wrong_pid() {
+        let dir = std::env::temp_dir().join(format!("seance-ready-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let sock = dir.join("ctl.sock");
+        let ver = env!("CARGO_PKG_VERSION");
+        let (_h, _) = spawn_ready_listener(
+            &sock,
+            &format!(r#"{{"ok":true,"pid":99999,"version":"{ver}"}}"#),
+        );
+        let out = probe_daemon_ready(&sock, std::process::id(), ver);
+        assert_eq!(out, ReadyProbeOutcome::WrongPid { got: 99999 });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ready_probe_accepts_expected_pid_and_version() {
+        let dir = std::env::temp_dir().join(format!("seance-ready-ok-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let sock = dir.join("ctl.sock");
+        let pid = std::process::id();
+        let ver = env!("CARGO_PKG_VERSION");
+        let (_h, _) = spawn_ready_listener(
+            &sock,
+            &format!(r#"{{"ok":true,"pid":{pid},"version":"{ver}"}}"#),
+        );
+        let out = probe_daemon_ready(&sock, pid, ver);
+        assert_eq!(out, ReadyProbeOutcome::Matched);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ready_probe_malformed_and_closed_fail() {
+        assert_eq!(
+            evaluate_ready_response("not-json", 42, "0.0.0"),
+            ReadyProbeOutcome::Malformed
+        );
+        let dir = std::env::temp_dir().join(format!("seance-ready-close-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let sock = dir.join("ctl.sock");
+        let path = sock.clone();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let _h = thread::spawn(move || {
+            let _ = std::fs::remove_file(&path);
+            let listener = UnixListener::bind(&path).expect("bind");
+            ready_tx.send(()).ok();
+            if let Ok((stream, _)) = listener.accept() {
+                let mut hello = String::new();
+                let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+                reader.read_line(&mut hello).expect("read probe hello");
+                let _ = stream.shutdown(std::net::Shutdown::Both);
+            }
+        });
+        ready_rx.recv().expect("bound");
+        assert_eq!(
+            probe_daemon_ready(&sock, std::process::id(), env!("CARGO_PKG_VERSION")),
+            ReadyProbeOutcome::Closed
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ensure_daemon_never_cold_spawns_while_initializing() {
+        let err = ensure_daemon_spawn_decision(false, Some(4242), true).unwrap_err();
+        assert!(err.to_string().contains("4242"), "unexpected: {err:#}");
+        assert!(ensure_daemon_spawn_decision(true, Some(4242), true).unwrap() == false);
+        assert!(ensure_daemon_spawn_decision(false, Some(4242), false).unwrap());
+        assert!(ensure_daemon_spawn_decision(false, None, false).unwrap());
+    }
+
+    #[test]
+    fn parse_daemon_pid_rejects_zero_and_one() {
+        assert_eq!(parse_daemon_pid_file_text("0\n"), None);
+        assert_eq!(parse_daemon_pid_file_text("1\n"), None);
+        assert_eq!(parse_daemon_pid_file_text("4242\n"), Some(4242));
+    }
+
+    #[test]
+    fn old_daemon_version_does_not_mask_its_different_pid() {
+        assert_eq!(
+            evaluate_ready_response(r#"{"ok":true,"pid":99,"version":"old"}"#, 42, "new"),
+            ReadyProbeOutcome::WrongPid { got: 99 }
+        );
+        assert_eq!(
+            evaluate_ready_response(r#"{"ok":true,"pid":42,"version":"old"}"#, 42, "new"),
+            ReadyProbeOutcome::WrongVersion
+        );
+    }
+
+    #[test]
+    fn recycled_pid_must_still_be_a_seance_daemon_command() {
+        assert!(cmdline_is_seance_daemon(
+            "/Applications/Seance.app/Contents/MacOS/seance daemon"
+        ));
+        assert!(cmdline_is_seance_daemon(
+            "seance daemon --takeover /tmp/handoff.sock"
+        ));
+        assert!(!cmdline_is_seance_daemon("seance"));
+        assert!(!cmdline_is_seance_daemon("seance restart-gui"));
+        assert!(!cmdline_is_seance_daemon("unrelated daemon"));
+    }
+
+    #[test]
+    fn cold_start_preserves_an_existing_listener_without_a_pid_file() {
+        let dir = std::env::temp_dir().join(format!("seance-cold-guard-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("ctl.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        assert!(guard_cold_daemon_start(&sock, &dir.join("daemon.pid")).is_err());
+        assert!(sock.exists());
+        drop(listener);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

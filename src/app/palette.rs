@@ -63,6 +63,11 @@ impl SeanceApp {
         let rows: Vec<(String, String, u64)> = self
             .known_workspace_names()
             .into_iter()
+            .filter(|ws| {
+                self.window_scope
+                    .fixed_workspace()
+                    .is_none_or(|fixed| ws == fixed)
+            })
             .map(|ws| {
                 let label = self.workspace_label(&ws);
                 let at = self.jump_recency(&ws);

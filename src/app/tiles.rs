@@ -256,10 +256,41 @@ impl SeanceApp {
         };
 
         if n == 0 {
+            if let Some(ws) = self.window_scope.fixed_workspace() {
+                if !self.scoped_target_available {
+                    let label = self.workspace_label(ws);
+                    return div()
+                        .flex_1()
+                        .h_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_color(SeancePalette::flame_dim())
+                                        .text_2xl()
+                                        .child("✦"),
+                                )
+                                .child(
+                                    div()
+                                        .text_color(SeancePalette::flame_dim())
+                                        .text_sm()
+                                        .child(format!("“{label}” is not available on the daemon")),
+                                ),
+                        )
+                        .into_any_element();
+                }
+            }
             // A second window with no subscriptions yet gets the summon
             // instructions, not the summon hint (empty_window is sticky for
             // the window's life; once a workspace arrives the normal path wins).
-            let hint = if self.empty_window && self.known_workspace_names().is_empty() {
+            let hint = if self.window_scope.is_blank() && self.known_workspace_names().is_empty() {
                 "empty window — this window subscribes to no circles yet.\nsummon a pane below to start one".to_string()
             } else {
                 let ws = self

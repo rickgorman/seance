@@ -4,7 +4,7 @@ members = ["crates/seance-core", "crates/seance-web"]
 exclude = ["deps"]
 
 [workspace.package]
-version = "0.26.2"
+version = "0.26.3"
 edition = "2021"
 
 [workspace.dependencies]
@@ -43,6 +43,7 @@ futures = "0.3"
 serde = { workspace = true }
 serde_json = { workspace = true }
 notify = "8"
+plist = "1"
 shellexpand = "3"
 libc = "0.2"
 base64 = { workspace = true }
@@ -51,6 +52,16 @@ tungstenite = "0.24"
 rand = "0.8"
 # Replay ring segments + bundles (pure-rust gzip; decodes in wasm too).
 flate2 = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+global-hotkey = "0.8.0"
+raw-window-handle = "0.6"
+cocoa = "0.26"
+objc = "0.2"
+
+# The pinned objc 0.2 macros emit this legacy feature check in callers.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
 
 # gpui-component declares its zed deps rev-less (tracks HEAD) and cargo ignores
 # transitive git lockfiles, so zed HEAD drift breaks the build. Cargo forbids

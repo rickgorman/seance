@@ -40,14 +40,15 @@ hex below is computed from that HSL (sRGB round). Authored with
 
 ## ANSI terminal palette (16-color)
 
-**Not this module.** Agent CLIs and shells render inside the embedded terminal
-against the **ghostty** 16-color palette, resolved daemon-side: `ANSI16` in
-`src/runtime/pty_session.rs` (`#181818` bg / `#d8d8d8` fg, base16-ish
-`#ab4642 #a1b56c #f7ca88 #7cafc2 #ba8baf #86c1b9` …), overridable by the
-program via OSC 4/10/11. The seance-tinted ANSI table that used to live here
-described `theme.rs::ansi_palette()`, which was removed 2026-07-22 with the
-dead local-PTY path — nothing read it. Change terminal colors in
-`pty_session.rs`; change chrome colors here.
+**Chrome vs terminal:** `SeancePalette` is candlelit app chrome only. Terminal
+cells use a device-local scheme in `~/.config/seance/desktop.json`
+(`terminal_color_scheme`, edited in Settings → Colors). The GUI resolves
+semantic color tags from `seance_core::terminal_color` against that scheme;
+explicit RGB and OSC overrides from the program stay authoritative.
+
+The daemon still owns baseline indexed colors in `pty_session.rs` for sessions
+and wire transport; client-side schemes change how tagged defaults paint without
+rewriting running PTY state.
 
 ## Public API (`src/theme.rs`)
 
@@ -78,7 +79,9 @@ Call order in `main`: `gpui_component::init(cx)` → **`theme::init(cx)`** →
 open window.
 
 `init()` does four steps (see `src/theme.rs::init`); it also loads
-`desktop.json` terminal font/size into `term_font` before windows open. Step 4
+`desktop.json` terminal font/size into `term_font` before windows open, and on
+macOS installs the process-wide window hotkey coordinator (`window_hotkeys`,
+Carbon via `global-hotkey`). Step 4
 is font-family hygiene on non-macOS — pick the first installed sans/mono rather
 than letting gpui probe, which is load-bearing for typing latency:
 

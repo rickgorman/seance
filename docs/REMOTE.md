@@ -52,6 +52,10 @@ stream its contents to the host. `--stdin` works too. `new --cwd`,
 `new --file` (a live document viewer), and `wait --artifact` use **host** paths.
 `pad --cat` and `wait --cat` return the host's scratchpad contents.
 
+`~/.config/seance/desktop.json` is **device-local** (font, terminal color
+scheme, in-app shortcuts, macOS window show/hide hotkeys, dedicated workspace
+windows). It never syncs through the daemon; each GUI machine keeps its own copy.
+
 The mac bundle installer links `~/.local/bin/seance` to the installed app,
 and updates the legacy `~/.cargo/bin/seance` link if it points at this repo's
 build. Use `--cli-dir DIR` to choose a different CLI directory. Add that

@@ -17,6 +17,12 @@ Cost ≈ `visible_terminals × cells × paint_rate`. Cliffs at **3 tiles**
 
 ### Wire (SCG3)
 
+SCG3 version 2 retains ANSI palette references inside the existing 32-bit color
+fields. Native clients resolve those references using their selected scheme;
+explicit RGB and application OSC color overrides remain literal. Version 1
+frames, including historical recordings, remain readable. The binary cell
+layout and SCZ3 compression container are unchanged.
+
 - Live event: `grid_bin` = base64 of binary blob (not JSON cells).
 - **FULL** frame or **DAMAGE** (only dirty rows).
 - Daemon caches last cells per pane; skips identical frames; cursor-only →
@@ -45,8 +51,9 @@ splits). That crisis throttle is gone — if it's on screen, it runs live.
 - Resize hysteresis (no col 120↔121 thrash).
 - `Arc` snapshots; cached cell metrics keyed by font revision/family/size
   (shape ASCII `M` in the user-selected monospace face from `desktop.json`).
-- Shaped-run and paint-replay caches include font revision so equal-width
-  faces do not reuse stale glyphs after a font switch.
+- Shaped-run and paint-replay caches include font revision and terminal palette
+  generation so equal-width faces and unchanged grids still repaint after font or
+  color scheme changes without a full grid reshape.
 - **Local echo** for printable keys on focus (daemon frame wins by rev).
 - **Typing hot** (`src/term_shared.rs`) — a human keystroke marks the app hot
   for 250ms; applied grids paint immediately while hot, ~30fps otherwise

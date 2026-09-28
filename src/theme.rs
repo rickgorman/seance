@@ -142,6 +142,7 @@ pub fn init(cx: &mut App) {
         cx.text_system().all_font_names().into_iter().collect();
     crate::term_font::init(&installed_fonts);
     crate::app::preferences::init(&installed_fonts, cx.text_system());
+    crate::app::window_hotkeys::WindowHotkeys::init(cx);
     let theme = Theme::global_mut(cx);
 
     // 2. Overwrite ThemeColor fields with the candlelit palette. `theme` derefs

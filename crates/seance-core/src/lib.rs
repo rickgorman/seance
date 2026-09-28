@@ -21,4 +21,5 @@ pub mod links;
 pub mod protocol;
 pub mod replay;
 pub mod snapshot;
+pub mod terminal_color;
 pub mod util;

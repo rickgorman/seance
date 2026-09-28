@@ -28,6 +28,10 @@ use alacritty_terminal::{
 };
 use anyhow::{bail, Context as _, Result};
 
+use seance_core::terminal_color::{
+    self, encode_index, CURSOR_COLOR, DEFAULT_ANSI16, DEFAULT_BG, DEFAULT_COLOR, DEFAULT_FG,
+};
+
 use super::snapshot::{CellSnap, GhostSnap, GridSnapshot};
 use super::upgrade_in_progress;
 
@@ -383,11 +387,7 @@ impl PtySession {
             scrolling_history: SCROLL_HISTORY,
             ..Config::default()
         };
-        let mut term = Term::new(term_config, &dims, listener);
-        // Seed the palette through the public parser so Named/Indexed colors
-        // resolve before the client issues OSC. Without this, cells painted as
-        // "default fg" stay monochrome and Claude's logo never gets orange.
-        seed_term_palette(&mut term);
+        let term = Term::new(term_config, &dims, listener);
         let term = Arc::new(FairMutex::new(term));
 
         let master_file = File::from(master);
@@ -615,8 +615,8 @@ impl PtySession {
             }
             for col in 0..cols as usize {
                 let cell = &grid[line][Column(col)];
-                let fg = resolve_color(colors, &cell.fg, cell.flags, false);
-                let bg = resolve_color(colors, &cell.bg, Flags::empty(), true);
+                let fg = project_color(colors, &cell.fg, cell.flags, false);
+                let bg = project_color(colors, &cell.bg, Flags::empty(), true);
                 let has_link = cell.hyperlink().map(|h| h.uri().to_string());
                 match (&mut open_link, has_link) {
                     (Some((r, cs, uri)), Some(u)) if *r == row_u && *uri == u => {
@@ -1023,35 +1023,10 @@ fn set_nonblocking(fd: RawFd) -> Result<()> {
     Ok(())
 }
 
-/// Ghostty palette from ~/.config/ghostty/config (exact).
-/// Terminal *content* matches ghostty — chrome stays candlelit separately.
-const ANSI16: [u32; 16] = [
-    0x00_18_18_18, //  0 black
-    0x00_ab_46_42, //  1 red
-    0x00_a1_b5_6c, //  2 green
-    0x00_f7_ca_88, //  3 yellow
-    0x00_7c_af_c2, //  4 blue
-    0x00_ba_8b_af, //  5 magenta
-    0x00_86_c1_b9, //  6 cyan
-    0x00_d8_d8_d8, //  7 white
-    0x00_58_58_58, //  8 bright black
-    0x00_ab_46_42, //  9 bright red
-    0x00_a1_b5_6c, // 10 bright green
-    0x00_f7_ca_88, // 11 bright yellow
-    0x00_7c_af_c2, // 12 bright blue
-    0x00_ba_8b_af, // 13 bright magenta
-    0x00_86_c1_b9, // 14 bright cyan
-    0x00_f8_f8_f8, // 15 bright white
-];
-
-/// Default fg/bg — ghostty's foreground/background.
-const DEFAULT_FG: u32 = 0x00_d8_d8_d8;
-const DEFAULT_BG: u32 = 0x00_18_18_18;
-
 /// Answer OSC color queries (claude probes these to pick its dark theme).
 fn color_for_index(index: usize) -> AlacRgb {
     let pack = match index {
-        0..=15 => ANSI16[index],
+        0..=15 => DEFAULT_ANSI16[index],
         16..=231 => {
             let i = index - 16;
             let steps = [0u32, 95, 135, 175, 215, 255];
@@ -1061,9 +1036,9 @@ fn color_for_index(index: usize) -> AlacRgb {
             let v = (8 + (index - 232) * 10) as u32;
             (v << 16) | (v << 8) | v
         }
-        256 => DEFAULT_FG,    // foreground
-        257 => DEFAULT_BG,    // background
-        258 => 0x00_e5_c0_7b, // cursor
+        256 => DEFAULT_FG,                     // foreground
+        257 => DEFAULT_BG,                     // background
+        258 => terminal_color::DEFAULT_CURSOR, // cursor
         _ => DEFAULT_FG,
     };
     AlacRgb {
@@ -1077,173 +1052,100 @@ fn pack_rgb(rgb: AlacRgb) -> u32 {
     ((rgb.r as u32) << 16) | ((rgb.g as u32) << 8) | (rgb.b as u32)
 }
 
-fn unpack_rgb(pack: u32) -> AlacRgb {
-    AlacRgb {
-        r: ((pack >> 16) & 0xff) as u8,
-        g: ((pack >> 8) & 0xff) as u8,
-        b: (pack & 0xff) as u8,
-    }
-}
-
-/// Initialize term.colors via OSC so the palette is non-empty from the start.
-fn seed_term_palette(term: &mut Term<Listener>) {
-    let mut parser: Processor = Processor::new();
-    let mut seq = String::new();
-    for (i, &pack) in ANSI16.iter().enumerate() {
-        let c = unpack_rgb(pack);
-        // OSC 4 ; idx ; rgb:RR/GG/BB ST
-        seq.push_str(&format!(
-            "\x1b]4;{i};rgb:{r:02x}{r:02x}/{g:02x}{g:02x}/{b:02x}{b:02x}\x1b\\",
-            r = c.r,
-            g = c.g,
-            b = c.b,
-        ));
-    }
-    let fg = unpack_rgb(DEFAULT_FG);
-    let bg = unpack_rgb(DEFAULT_BG);
-    // OSC 10 default fg, OSC 11 default bg
-    seq.push_str(&format!(
-        "\x1b]10;rgb:{r:02x}{r:02x}/{g:02x}{g:02x}/{b:02x}{b:02x}\x1b\\",
-        r = fg.r,
-        g = fg.g,
-        b = fg.b,
-    ));
-    seq.push_str(&format!(
-        "\x1b]11;rgb:{r:02x}{r:02x}/{g:02x}{g:02x}/{b:02x}{b:02x}\x1b\\",
-        r = bg.r,
-        g = bg.g,
-        b = bg.b,
-    ));
-    parser.advance(term, seq.as_bytes());
-}
-
-fn dim_u32(c: u32) -> u32 {
-    let r = ((c >> 16) & 0xff) * 65 / 100;
-    let g = ((c >> 8) & 0xff) * 65 / 100;
-    let b = (c & 0xff) * 65 / 100;
-    (r << 16) | (g << 8) | b
-}
-
-/// Resolve a cell color the way alacritty's display does: prefer the term's
-/// live palette (OSC-set), then static ANSI16, with bold→bright for 0..=7.
-fn resolve_color(
+/// Pack a grid cell color for transport: OSC/truecolor stay explicit RGB;
+/// baseline palette slots become tags for client-side scheme painting.
+fn project_color(
     colors: &alacritty_terminal::term::color::Colors,
     color: &AnsiColor,
     flags: Flags,
     is_bg: bool,
 ) -> u32 {
-    const DEFAULT: u32 = 0xFFFF_FFFF;
     match color {
         AnsiColor::Spec(rgb) => {
             let packed = pack_rgb(*rgb);
             if flags.contains(Flags::DIM) {
-                dim_u32(packed)
+                terminal_color::dim_u32(packed)
             } else {
                 packed
             }
         }
         AnsiColor::Named(n) => {
-            // Bold/dim named variants first (alacritty display does this).
-            let named = if flags.contains(Flags::BOLD) && !flags.contains(Flags::DIM) {
+            let bold_only = flags.contains(Flags::BOLD) && !flags.contains(Flags::DIM);
+            let dim_flag = flags.contains(Flags::DIM);
+            let for_lookup = if bold_only {
                 n.to_bright()
-            } else if flags.contains(Flags::DIM) {
+            } else if dim_flag {
                 n.to_dim()
             } else {
                 *n
             };
-            // Prefer the live palette (OSC 4/10/11). Claude sets these and then
-            // paints with Named Foreground/Background — if we skip the lookup
-            // and return a sentinel, the logo/text all go monochrome white.
-            if let Some(rgb) = colors[named] {
+            if let Some(rgb) = colors[for_lookup] {
                 return pack_rgb(rgb);
             }
-            // Also try the raw named color before bright/dim transform.
             if let Some(rgb) = colors[*n] {
                 return pack_rgb(rgb);
             }
-            // Default fg/bg with no OSC override → sentinel so the GUI can
-            // paint its own default (cool white / dark).
             if matches!(n, NamedColor::Background) && is_bg {
-                return DEFAULT;
+                return DEFAULT_COLOR;
             }
             if matches!(n, NamedColor::Foreground) && !is_bg {
-                return DEFAULT;
+                return DEFAULT_COLOR;
             }
-            named_fallback(named, is_bg)
+            // Tags: DIM on a normal named slot is client-dim only; raw Dim* keeps pre_dim.
+            let for_tag = if bold_only { n.to_bright() } else { *n };
+            named_transport(for_tag, is_bg)
         }
         AnsiColor::Indexed(idx) => {
             let mut idx = *idx as usize;
-            // Bold on 0..=7 → bright 8..=15.
             if flags.contains(Flags::BOLD) && (0..=7).contains(&idx) {
                 idx += 8;
             }
             if let Some(rgb) = colors[idx] {
                 let packed = pack_rgb(rgb);
                 return if flags.contains(Flags::DIM) {
-                    dim_u32(packed)
+                    terminal_color::dim_u32(packed)
                 } else {
                     packed
                 };
             }
-            indexed_fallback(idx, flags.contains(Flags::DIM))
+            encode_index(idx as u8, flags.contains(Flags::DIM))
         }
     }
 }
 
-fn named_fallback(n: NamedColor, is_bg: bool) -> u32 {
-    const DEFAULT: u32 = 0xFFFF_FFFF;
-    match n {
-        NamedColor::Background if is_bg => DEFAULT,
-        NamedColor::Foreground if !is_bg => DEFAULT,
-        NamedColor::Black => ANSI16[0],
-        NamedColor::Red => ANSI16[1],
-        NamedColor::Green => ANSI16[2],
-        NamedColor::Yellow => ANSI16[3],
-        NamedColor::Blue => ANSI16[4],
-        NamedColor::Magenta => ANSI16[5],
-        NamedColor::Cyan => ANSI16[6],
-        NamedColor::White => ANSI16[7],
-        NamedColor::BrightBlack => ANSI16[8],
-        NamedColor::BrightRed => ANSI16[9],
-        NamedColor::BrightGreen => ANSI16[10],
-        NamedColor::BrightYellow => ANSI16[11],
-        NamedColor::BrightBlue => ANSI16[12],
-        NamedColor::BrightMagenta => ANSI16[13],
-        NamedColor::BrightCyan => ANSI16[14],
-        NamedColor::BrightWhite | NamedColor::BrightForeground => ANSI16[15],
+fn named_transport(named: NamedColor, is_bg: bool) -> u32 {
+    match named {
+        NamedColor::Background if is_bg => DEFAULT_COLOR,
+        NamedColor::Foreground if !is_bg => DEFAULT_COLOR,
+        NamedColor::Cursor => CURSOR_COLOR,
         NamedColor::Foreground => DEFAULT_FG,
         NamedColor::Background => DEFAULT_BG,
-        NamedColor::Cursor => 0x00_e5_c0_7b,
-        NamedColor::DimBlack => dim_u32(ANSI16[0]),
-        NamedColor::DimRed => dim_u32(ANSI16[1]),
-        NamedColor::DimGreen => dim_u32(ANSI16[2]),
-        NamedColor::DimYellow => dim_u32(ANSI16[3]),
-        NamedColor::DimBlue => dim_u32(ANSI16[4]),
-        NamedColor::DimMagenta => dim_u32(ANSI16[5]),
-        NamedColor::DimCyan => dim_u32(ANSI16[6]),
-        NamedColor::DimWhite => dim_u32(ANSI16[7]),
-        NamedColor::DimForeground => dim_u32(DEFAULT_FG),
-    }
-}
-
-fn indexed_fallback(idx: usize, dim: bool) -> u32 {
-    let packed = match idx {
-        0..=15 => ANSI16[idx],
-        16..=231 => {
-            let j = idx - 16;
-            let steps = [0u32, 95, 135, 175, 215, 255];
-            (steps[j / 36] << 16) | (steps[(j / 6) % 6] << 8) | steps[j % 6]
-        }
-        232..=255 => {
-            let v = (8 + (idx - 232) * 10) as u32;
-            (v << 16) | (v << 8) | v
-        }
-        _ => DEFAULT_FG,
-    };
-    if dim {
-        dim_u32(packed)
-    } else {
-        packed
+        NamedColor::BrightForeground => encode_index(15, false),
+        NamedColor::Black => encode_index(0, false),
+        NamedColor::Red => encode_index(1, false),
+        NamedColor::Green => encode_index(2, false),
+        NamedColor::Yellow => encode_index(3, false),
+        NamedColor::Blue => encode_index(4, false),
+        NamedColor::Magenta => encode_index(5, false),
+        NamedColor::Cyan => encode_index(6, false),
+        NamedColor::White => encode_index(7, false),
+        NamedColor::BrightBlack => encode_index(8, false),
+        NamedColor::BrightRed => encode_index(9, false),
+        NamedColor::BrightGreen => encode_index(10, false),
+        NamedColor::BrightYellow => encode_index(11, false),
+        NamedColor::BrightBlue => encode_index(12, false),
+        NamedColor::BrightMagenta => encode_index(13, false),
+        NamedColor::BrightCyan => encode_index(14, false),
+        NamedColor::BrightWhite => encode_index(15, false),
+        NamedColor::DimBlack => encode_index(0, true),
+        NamedColor::DimRed => encode_index(1, true),
+        NamedColor::DimGreen => encode_index(2, true),
+        NamedColor::DimYellow => encode_index(3, true),
+        NamedColor::DimBlue => encode_index(4, true),
+        NamedColor::DimMagenta => encode_index(5, true),
+        NamedColor::DimCyan => encode_index(6, true),
+        NamedColor::DimWhite => encode_index(7, true),
+        NamedColor::DimForeground => terminal_color::dim_u32(DEFAULT_FG),
     }
 }
 
@@ -1294,5 +1196,118 @@ mod tests {
         s.seed_rev(100);
         s.seed_rev(7);
         assert_eq!(s.rev(), 101);
+    }
+
+    #[test]
+    fn project_color_tags_baseline_but_keeps_spec_and_osc() {
+        use alacritty_terminal::term::color::Colors;
+        let colors = Colors::default();
+        let red = project_color(
+            &colors,
+            &AnsiColor::Named(NamedColor::Red),
+            Flags::empty(),
+            false,
+        );
+        assert_eq!(red, encode_index(1, false));
+
+        let spec = AlacRgb {
+            r: 0xab,
+            g: 0x46,
+            b: 0x42,
+        };
+        let same_as_ansi = project_color(&colors, &AnsiColor::Spec(spec), Flags::empty(), false);
+        assert_eq!(same_as_ansi, 0x00_ab_46_42);
+        assert_ne!(same_as_ansi, red);
+
+        let mut osc = Colors::default();
+        osc[NamedColor::Green] = Some(AlacRgb {
+            r: 0x11,
+            g: 0x22,
+            b: 0x33,
+        });
+        let green = project_color(
+            &osc,
+            &AnsiColor::Named(NamedColor::Green),
+            Flags::empty(),
+            false,
+        );
+        assert_eq!(green, 0x00_11_22_33);
+
+        let idx = project_color(&colors, &AnsiColor::Indexed(2), Flags::DIM, false);
+        assert_eq!(idx, encode_index(2, true));
+
+        let bold = project_color(&colors, &AnsiColor::Indexed(1), Flags::BOLD, false);
+        assert_eq!(bold, encode_index(9, false));
+
+        let fg = project_color(
+            &colors,
+            &AnsiColor::Named(NamedColor::Foreground),
+            Flags::empty(),
+            false,
+        );
+        assert_eq!(fg, DEFAULT_COLOR);
+    }
+
+    #[test]
+    fn project_color_dim_and_bold_table() {
+        use alacritty_terminal::term::color::Colors;
+        let colors = Colors::default();
+        let spec = AlacRgb {
+            r: 0xab,
+            g: 0x46,
+            b: 0x42,
+        };
+
+        let named_dim = project_color(
+            &colors,
+            &AnsiColor::Named(NamedColor::Red),
+            Flags::DIM,
+            false,
+        );
+        assert_eq!(named_dim, encode_index(1, false));
+
+        let raw_dim = project_color(
+            &colors,
+            &AnsiColor::Named(NamedColor::DimRed),
+            Flags::empty(),
+            false,
+        );
+        assert_eq!(raw_dim, encode_index(1, true));
+
+        let bold_dim = project_color(
+            &colors,
+            &AnsiColor::Named(NamedColor::Red),
+            Flags::BOLD | Flags::DIM,
+            false,
+        );
+        assert_eq!(bold_dim, encode_index(1, false));
+
+        let spec_dim = project_color(&colors, &AnsiColor::Spec(spec), Flags::DIM, false);
+        assert_eq!(spec_dim, terminal_color::dim_u32(0x00_ab_46_42));
+
+        let default_fg_dim = project_color(
+            &colors,
+            &AnsiColor::Named(NamedColor::Foreground),
+            Flags::DIM,
+            false,
+        );
+        assert_eq!(default_fg_dim, DEFAULT_COLOR);
+
+        let mut osc = Colors::default();
+        osc[NamedColor::Red] = Some(spec);
+        let osc_red = project_color(
+            &osc,
+            &AnsiColor::Named(NamedColor::Red),
+            Flags::empty(),
+            false,
+        );
+        assert_eq!(osc_red, 0x00_ab_46_42);
+        let osc_reset = project_color(
+            &Colors::default(),
+            &AnsiColor::Named(NamedColor::Red),
+            Flags::empty(),
+            false,
+        );
+        assert_eq!(osc_reset, encode_index(1, false));
     }
 }

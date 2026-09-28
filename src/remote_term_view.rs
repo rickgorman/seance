@@ -23,6 +23,7 @@ use crate::term_font::{self, font_size, term_font, term_font_bold, LINE_HEIGHT_F
 use crate::term_shared::keystroke_bytes;
 use crate::theme::SeancePalette;
 use alacritty_terminal::term::TermMode;
+use seance_core::terminal_color::{self, resolve, DEFAULT_COLOR};
 
 /// Read the PRIMARY selection — the middle-click paste source. Mirrors the
 /// copy path: on Wayland prefer `wl-paste` (keeps compositor clipboard traffic
@@ -756,6 +757,8 @@ impl Render for RemoteTerminalView {
                             let ghost = term.read(cx).ghost.clone();
                             let slug = term.read(cx).slug.clone();
                             let input_origin = term.read(cx).last_input_origin.clone();
+                            let (palette, palette_gen) =
+                                crate::app::colors::paint_palette_snapshot();
                             Layout {
                                 slug,
                                 bounds,
@@ -763,6 +766,8 @@ impl Render for RemoteTerminalView {
                                 line_h,
                                 font_size: px(font_size()),
                                 font_rev: term_font::revision(),
+                                palette,
+                                palette_gen,
                                 snap,
                                 ghost_text: ghost.map(|g| g.text),
                                 input_origin,
@@ -877,6 +882,7 @@ impl Render for OverviewThumb {
                         // Font tracks scale so glyphs stay inside cells.
                         let fs = font_size();
                         let font_size = px((fs * scale).clamp(6.0, fs));
+                        let (palette, palette_gen) = crate::app::colors::paint_palette_snapshot();
                         Layout {
                             // Separate cache key from the live full-size view.
                             // Include scale+scroll so crop pans invalidate cache.
@@ -886,6 +892,8 @@ impl Render for OverviewThumb {
                             line_h,
                             font_size,
                             font_rev: term_font::revision(),
+                            palette,
+                            palette_gen,
                             snap,
                             ghost_text: ghost.map(|g| g.text),
                             input_origin,
@@ -911,6 +919,8 @@ struct Layout {
     line_h: Pixels,
     font_size: Pixels,
     font_rev: u64,
+    palette: Arc<crate::app::colors::ColorScheme>,
+    palette_gen: u64,
     snap: Arc<crate::runtime::snapshot::GridSnapshot>,
     ghost_text: Option<String>,
     /// Causal tint: who last wrote stdin.
@@ -950,6 +960,11 @@ fn load_metrics(slug: &str) -> Option<ViewMetrics> {
 struct ShapedPaintCache {
     rev: u64,
     font_rev: u64,
+    palette_gen: u64,
+    cursor_row: u16,
+    cursor_col: u16,
+    cursor_block: bool,
+    default_bg: Hsla,
     origin_x: f32,
     origin_y: f32,
     width: f32,
@@ -963,7 +978,8 @@ struct ShapedPaintCache {
     selection_key: Option<(u16, u16, u16, u16)>,
     rects: Vec<(f32, f32, f32, f32, Hsla)>,
     texts: Vec<(f32, f32, ShapedLine)>,
-    cursor: (f32, f32, f32, f32),
+    /// Bar cursor overlay (block cursor bg is in `rects`).
+    cursor_bar: Option<(f32, f32, f32, f32, Hsla)>,
     ghost_shaped: Option<(f32, f32, ShapedLine)>,
 }
 
@@ -990,6 +1006,10 @@ fn shaped_paint_caches() -> &'static Mutex<HashMap<String, ShapedPaintCache>> {
 fn cache_matches(c: &ShapedPaintCache, layout: &Layout) -> bool {
     c.rev == layout.snap.rev
         && c.font_rev == layout.font_rev
+        && c.palette_gen == layout.palette_gen
+        && c.cursor_row == layout.snap.cursor_row
+        && c.cursor_col == layout.snap.cursor_col
+        && c.cursor_block == layout.snap.cursor_shape_block
         && c.origin_x == f32::from(layout.bounds.origin.x)
         && c.origin_y == f32::from(layout.bounds.origin.y)
         && c.width == f32::from(layout.bounds.size.width)
@@ -1007,7 +1027,8 @@ fn replay_shaped_paint(c: &ShapedPaintCache, window: &mut Window, cx: &mut App) 
         origin: point(px(c.origin_x), px(c.origin_y)),
         size: gpui::size(px(c.width), px(c.height)),
     };
-    window.paint_quad(fill(bounds, term_default_bg()));
+    let bg = c.default_bg;
+    window.paint_quad(fill(bounds, bg));
     for &(x, y, w, h, color) in &c.rects {
         window.paint_quad(fill(
             Bounds {
@@ -1028,14 +1049,15 @@ fn replay_shaped_paint(c: &ShapedPaintCache, window: &mut Window, cx: &mut App) 
             cx,
         );
     }
-    let (cx0, cy0, cw, ch) = c.cursor;
-    window.paint_quad(fill(
-        Bounds {
-            origin: point(px(cx0), px(cy0)),
-            size: gpui::size(px(cw), px(ch)),
-        },
-        SeancePalette::flame().opacity(0.85),
-    ));
+    if let Some((cx0, cy0, cw, ch, color)) = c.cursor_bar {
+        window.paint_quad(fill(
+            Bounds {
+                origin: point(px(cx0), px(cy0)),
+                size: gpui::size(px(cw), px(ch)),
+            },
+            color,
+        ));
+    }
     if let Some((x, y, shaped)) = &c.ghost_shaped {
         let _ = shaped.paint(
             point(px(*x), px(*y)),
@@ -1096,35 +1118,67 @@ fn cell_metrics(window: &mut Window) -> (Pixels, Pixels) {
     (px(w), px(h))
 }
 
-/// Clears shaped-run and paint replay caches after a font change.
-pub fn invalidate_terminal_caches() {
+/// Clears paint replay caches after a palette change (shaped-run cache is keyed by fg).
+pub fn invalidate_shaped_paint_caches() {
     if let Ok(mut g) = shaped_paint_caches().lock() {
         g.clear();
     }
+}
+
+/// Clears shaped-run and paint replay caches after a font change.
+pub fn invalidate_terminal_caches() {
+    invalidate_shaped_paint_caches();
     if let Some(cache) = SHAPE_CACHE.get() {
         cache.lock().unwrap().clear();
     }
 }
 
 fn term_default_fg() -> Hsla {
-    // ghostty foreground = #d8d8d8
-    gpui::Rgba {
-        r: 0xd8 as f32 / 255.,
-        g: 0xd8 as f32 / 255.,
-        b: 0xd8 as f32 / 255.,
-        a: 1.,
-    }
-    .into()
+    let (scheme, _) = crate::app::colors::paint_palette_snapshot();
+    crate::app::colors::rgb24_to_hsla(scheme.foreground)
 }
+
 fn term_default_bg() -> Hsla {
-    // ghostty background = #181818
-    gpui::Rgba {
-        r: 0x18 as f32 / 255.,
-        g: 0x18 as f32 / 255.,
-        b: 0x18 as f32 / 255.,
-        a: 1.,
+    let (scheme, _) = crate::app::colors::paint_palette_snapshot();
+    crate::app::colors::rgb24_to_hsla(scheme.background)
+}
+
+struct PaintPalette {
+    fg_u32: u32,
+    bg_u32: u32,
+    cursor_u32: u32,
+    cursor_text_u32: u32,
+    default_bg: Hsla,
+    cursor_fill: Hsla,
+    sel_fg: Hsla,
+    sel_bg: Hsla,
+    bold_u32: Option<u32>,
+    ansi16: [u32; 16],
+}
+
+impl PaintPalette {
+    fn from_scheme(scheme: &crate::app::colors::ColorScheme) -> Self {
+        let ansi16 = crate::app::colors::scheme_ansi16_u32(scheme);
+        Self {
+            fg_u32: scheme.foreground.as_u32(),
+            bg_u32: scheme.background.as_u32(),
+            cursor_u32: scheme.cursor.as_u32(),
+            cursor_text_u32: scheme.cursor_text.as_u32(),
+            default_bg: crate::app::colors::rgb24_to_hsla(scheme.background),
+            cursor_fill: crate::app::colors::rgb24_to_hsla(scheme.cursor),
+            sel_fg: crate::app::colors::rgb24_to_hsla(scheme.selection_foreground),
+            sel_bg: crate::app::colors::rgb24_to_hsla(scheme.selection_background),
+            bold_u32: scheme.bold.map(|b| b.as_u32()),
+            ansi16,
+        }
     }
-    .into()
+}
+
+fn rgb_u32_to_hsla(v: u32) -> Hsla {
+    crate::app::colors::rgb24_to_hsla(
+        crate::app::colors::Rgb24::from_u32(v)
+            .unwrap_or(crate::app::colors::Rgb24::from_rgb(0, 0, 0)),
+    )
 }
 
 /// SEANCE_DEBUG_RENDER=1 paint accounting: (replays, reshapes, reshape ns).
@@ -1251,8 +1305,9 @@ fn paint_grid(layout: &Layout, window: &mut Window, cx: &mut App) {
     }
     let reshape_t0 = std::time::Instant::now();
 
+    let pal = PaintPalette::from_scheme(layout.palette.as_ref());
     let origin = layout.bounds.origin;
-    let bg = term_default_bg();
+    let bg = pal.default_bg;
     window.paint_quad(fill(layout.bounds, bg));
 
     let cols = layout.snap.cols as usize;
@@ -1276,12 +1331,15 @@ fn paint_grid(layout: &Layout, window: &mut Window, cx: &mut App) {
     };
 
     let cursor_row = layout.snap.cursor_row as usize;
+    let cursor_col = layout.snap.cursor_col as usize;
+    let cursor_block = layout.snap.cursor_shape_block;
     let sel = layout.selection.as_ref();
     let sel_cols = layout.snap.cols;
     let sel_rows = layout.snap.rows;
     let in_sel =
         |row: usize, col: usize| sel.is_some_and(|s| s.contains(row, col, sel_cols, sel_rows));
-    let sel_bg = SeancePalette::violet_dim().opacity(0.55);
+    let sel_bg = pal.sel_bg;
+    let sel_fg = pal.sel_fg;
 
     for row in 0..rows {
         flush(&mut open, &mut batches);
@@ -1308,12 +1366,12 @@ fn paint_grid(layout: &Layout, window: &mut Window, cx: &mut App) {
                 break;
             }
             let cell = &layout.snap.cells[idx];
-            let mut style = cell_style(cell);
+            let is_cursor = row == cursor_row && col == cursor_col;
+            let mut style = cell_style(cell, &pal, cursor_block, is_cursor);
             let selected = in_sel(row, col);
-            if selected {
+            if selected && !(is_cursor && cursor_block) {
                 style.bg = Some(sel_bg);
-                // Keep text readable over selection tint.
-                style.fg = term_default_fg();
+                style.fg = sel_fg;
             }
 
             if let Some(bgc) = style.bg {
@@ -1402,14 +1460,21 @@ fn paint_grid(layout: &Layout, window: &mut Window, cx: &mut App) {
         let _ = shaped.paint(pos, layout.line_h, gpui::TextAlign::Left, None, window, cx);
     }
 
-    // Cursor.
+    // Bar cursor (block cursor bg is painted with cell backgrounds).
     let cc = layout.snap.cursor_col as f32;
     let cr = layout.snap.cursor_row as f32;
-    let cursor_bounds = Bounds {
-        origin: point(origin.x + layout.cell_w * cc, origin.y + layout.line_h * cr),
-        size: gpui::size(layout.cell_w, layout.line_h),
+    let cursor_bar = if cursor_block {
+        None
+    } else {
+        let bar_w = 2.0f32;
+        Some((
+            f32::from(origin.x) + f32::from(layout.cell_w) * cc,
+            f32::from(origin.y) + f32::from(layout.line_h) * cr,
+            bar_w,
+            f32::from(layout.line_h),
+            pal.cursor_fill,
+        ))
     };
-    window.paint_quad(fill(cursor_bounds, SeancePalette::flame().opacity(0.85)));
 
     let mut ghost_shaped = None;
     if let Some(ref g) = layout.ghost_text {
@@ -1434,6 +1499,16 @@ fn paint_grid(layout: &Layout, window: &mut Window, cx: &mut App) {
         let _ = shaped.paint(pos, layout.line_h, gpui::TextAlign::Left, None, window, cx);
     }
 
+    if let Some((x, y, w, h, color)) = cursor_bar {
+        window.paint_quad(fill(
+            Bounds {
+                origin: point(px(x), px(y)),
+                size: gpui::size(px(w), px(h)),
+            },
+            color,
+        ));
+    }
+
     if layout.origin_gutter {
         paint_origin_gutter(layout, window);
     }
@@ -1444,6 +1519,11 @@ fn paint_grid(layout: &Layout, window: &mut Window, cx: &mut App) {
             ShapedPaintCache {
                 rev: layout.snap.rev,
                 font_rev: layout.font_rev,
+                palette_gen: layout.palette_gen,
+                cursor_row: layout.snap.cursor_row,
+                cursor_col: layout.snap.cursor_col,
+                cursor_block: layout.snap.cursor_shape_block,
+                default_bg: pal.default_bg,
                 origin_x: f32::from(origin.x),
                 origin_y: f32::from(origin.y),
                 width: f32::from(layout.bounds.size.width),
@@ -1456,12 +1536,7 @@ fn paint_grid(layout: &Layout, window: &mut Window, cx: &mut App) {
                 selection_key: selection_key(&layout.selection, layout.snap.cols, layout.snap.rows),
                 rects: cache_rects,
                 texts: cache_texts,
-                cursor: (
-                    f32::from(cursor_bounds.origin.x),
-                    f32::from(cursor_bounds.origin.y),
-                    f32::from(cursor_bounds.size.width),
-                    f32::from(cursor_bounds.size.height),
-                ),
+                cursor_bar,
                 ghost_shaped,
             },
         );
@@ -1500,30 +1575,40 @@ struct Style {
     bold: bool,
 }
 
-fn cell_style(c: &CellSnap) -> Style {
-    let mut fg = u32_to_hsla(c.fg).unwrap_or_else(term_default_fg);
-    let mut bg = u32_to_hsla(c.bg);
-    if c.inverse {
-        std::mem::swap(&mut fg, &mut bg.get_or_insert_with(term_default_bg));
+fn cell_style(c: &CellSnap, pal: &PaintPalette, cursor_block: bool, is_cursor: bool) -> Style {
+    let mut fg_packed = resolve(c.fg, pal.fg_u32, &pal.ansi16, pal.cursor_u32);
+    if c.bold && terminal_color::is_default_color(c.fg) {
+        if let Some(b) = pal.bold_u32 {
+            fg_packed = b;
+        }
     }
+    let bg_packed = if c.bg == DEFAULT_COLOR {
+        None
+    } else {
+        Some(resolve(c.bg, pal.bg_u32, &pal.ansi16, pal.cursor_u32))
+    };
+
+    let mut fg = rgb_u32_to_hsla(fg_packed);
+    let mut bg = bg_packed.map(rgb_u32_to_hsla);
+
+    if c.inverse {
+        std::mem::swap(&mut fg, &mut bg.get_or_insert_with(|| pal.default_bg));
+    }
+
     if c.dim {
         fg = fg.opacity(0.65);
     }
+
+    if is_cursor && cursor_block {
+        fg = rgb_u32_to_hsla(pal.cursor_text_u32);
+        bg = Some(rgb_u32_to_hsla(pal.cursor_u32));
+    }
+
     Style {
         fg,
         bg,
         bold: c.bold,
     }
-}
-
-fn u32_to_hsla(v: u32) -> Option<Hsla> {
-    if v == 0xFFFF_FFFF {
-        return None;
-    }
-    let r = ((v >> 16) & 0xff) as f32 / 255.;
-    let g = ((v >> 8) & 0xff) as f32 / 255.;
-    let b = (v & 0xff) as f32 / 255.;
-    Some(gpui::Rgba { r, g, b, a: 1. }.into())
 }
 
 // silence unused import if FONT_FAMILY only re-exported
@@ -1656,6 +1741,7 @@ mod tests {
         snap.rev = 7;
         snap.cols = 80;
         snap.rows = 24;
+        let (palette, palette_gen) = crate::app::colors::paint_palette_snapshot();
         Layout {
             slug: "pane".into(),
             bounds: Bounds {
@@ -1666,6 +1752,8 @@ mod tests {
             line_h: px(20.),
             font_size: px(12.),
             font_rev,
+            palette,
+            palette_gen,
             snap: Arc::new(snap),
             ghost_text: None,
             input_origin: None,
@@ -1678,6 +1766,11 @@ mod tests {
         ShapedPaintCache {
             rev: layout.snap.rev,
             font_rev: layout.font_rev,
+            palette_gen: layout.palette_gen,
+            cursor_row: layout.snap.cursor_row,
+            cursor_col: layout.snap.cursor_col,
+            cursor_block: layout.snap.cursor_shape_block,
+            default_bg: term_default_bg(),
             origin_x: f32::from(layout.bounds.origin.x),
             origin_y: f32::from(layout.bounds.origin.y),
             width: f32::from(layout.bounds.size.width),
@@ -1690,9 +1783,19 @@ mod tests {
             selection_key: selection_key(&layout.selection, layout.snap.cols, layout.snap.rows),
             rects: Vec::new(),
             texts: Vec::new(),
-            cursor: (10., 20., 10., 20.),
+            cursor_bar: None,
             ghost_shaped: None,
         }
+    }
+
+    #[test]
+    fn shaped_paint_cache_misses_when_only_palette_gen_changes() {
+        let layout = sample_paint_layout(3);
+        let cache = shaped_cache_for_layout(&layout);
+        assert!(cache_matches(&cache, &layout));
+        let mut palette_changed = sample_paint_layout(3);
+        palette_changed.palette_gen = 99;
+        assert!(!cache_matches(&cache, &palette_changed));
     }
 
     #[test]
@@ -1708,5 +1811,86 @@ mod tests {
         let cache = shaped_cache_for_layout(&layout);
         let after_font_change = sample_paint_layout(4);
         assert!(!cache_matches(&cache, &after_font_change));
+    }
+
+    #[test]
+    fn shaped_paint_cache_misses_when_cursor_moves() {
+        let layout = sample_paint_layout(3);
+        let cache = shaped_cache_for_layout(&layout);
+        let mut moved = sample_paint_layout(3);
+        moved.snap = Arc::new({
+            let mut snap = (*moved.snap).clone();
+            snap.cursor_col = 5;
+            snap
+        });
+        assert!(!cache_matches(&cache, &moved));
+    }
+
+    fn test_palette() -> PaintPalette {
+        let scheme = crate::app::colors::ColorScheme {
+            foreground: crate::app::colors::Rgb24::from_hex("#D8D8D8").unwrap(),
+            background: crate::app::colors::Rgb24::from_hex("#181818").unwrap(),
+            cursor: crate::app::colors::Rgb24::from_hex("#E9A03A").unwrap(),
+            cursor_text: crate::app::colors::Rgb24::from_hex("#181818").unwrap(),
+            selection_background: crate::app::colors::Rgb24::from_hex("#5D4A7D").unwrap(),
+            selection_foreground: crate::app::colors::Rgb24::from_hex("#D8D8D8").unwrap(),
+            ..crate::app::colors::ColorScheme::default()
+        };
+        PaintPalette::from_scheme(&scheme)
+    }
+
+    #[test]
+    fn cell_style_dim_on_index_tag_not_predim() {
+        use seance_core::terminal_color::encode_index;
+        let pal = test_palette();
+        let cell = CellSnap {
+            c: 'x',
+            fg: encode_index(1, false),
+            bg: DEFAULT_COLOR,
+            bold: false,
+            dim: true,
+            italic: false,
+            underline: false,
+            inverse: false,
+        };
+        let style = cell_style(&cell, &pal, false, false);
+        assert!(style.fg.a < 1.0);
+    }
+
+    #[test]
+    fn cell_style_preserves_client_dim_on_predim_tag() {
+        use seance_core::terminal_color::encode_index;
+        let pal = test_palette();
+        let cell = CellSnap {
+            c: 'x',
+            fg: encode_index(1, true),
+            bg: DEFAULT_COLOR,
+            bold: false,
+            dim: true,
+            italic: false,
+            underline: false,
+            inverse: false,
+        };
+        let style = cell_style(&cell, &pal, false, false);
+        let undimmed = cell_style(&CellSnap { dim: false, ..cell }, &pal, false, false);
+        assert_eq!(style.fg, undimmed.fg.opacity(0.65));
+    }
+
+    #[test]
+    fn cell_style_block_cursor_wins_over_inverse_and_dim() {
+        let pal = test_palette();
+        let cell = CellSnap {
+            c: 'x',
+            fg: 0x00_FF_00_00,
+            bg: DEFAULT_COLOR,
+            bold: false,
+            dim: true,
+            italic: false,
+            underline: false,
+            inverse: true,
+        };
+        let style = cell_style(&cell, &pal, true, true);
+        assert_eq!(style.fg, rgb_u32_to_hsla(pal.cursor_text_u32));
+        assert_eq!(style.bg, Some(rgb_u32_to_hsla(pal.cursor_u32)));
     }
 }

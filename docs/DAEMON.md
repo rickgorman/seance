@@ -18,6 +18,7 @@ window is a disposable client. That is the use→develop→use loop.
   - `{"role":"ctl"}` — classic JSON-lines request/response (`seance ctl`)
   - `{"role":"gui"}` — bidirectional GUI protocol (snapshots + input)
   - `{"role":"handoff"}` — daemon upgrade only
+  - `{"role":"ready"}` — read-only PID/version acknowledgement for upgrade readiness
 
   The hello also carries the client's version, and the daemon requires an
   **exact** match — a stale GUI, `ctl`, or `seance web` bundle is refused with
@@ -52,6 +53,13 @@ still subscribed to a dead connection.
 4. New daemon **adopts** FDs only — it does **not** respawn a shell if handoff
    fails (respawn used to hide dead children and look like “only claude survived”).
 5. Old process exits. Children never saw SIGHUP when step 2 succeeded.
+6. The upgrade client waits for a readiness reply from the replacement PID
+   with the expected version. A connection to the old daemon does not count.
+
+The replacement publishes its PID before adopting sessions. A GUI starting
+during this handoff waits for the live daemon's socket instead of spawning
+another daemon. Cold starts also check for an existing owner before creating
+terminal processes.
 
 **Recorder across upgrade.** The replay ring recorder is armed unconditionally
 at daemon startup — fresh boot *and* `--takeover` alike — so a new daemon

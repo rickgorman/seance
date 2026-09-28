@@ -30,6 +30,7 @@ use std::sync::Arc;
 
 pub(crate) mod actions;
 mod chrome;
+pub(crate) mod colors;
 mod layout;
 mod menus;
 mod overview;
@@ -43,6 +44,7 @@ mod settings;
 mod sidebar;
 mod tiles;
 mod util;
+pub(crate) mod window_hotkeys;
 mod workspaces;
 
 use self::actions::*;
@@ -181,7 +183,7 @@ pub struct SeanceApp {
     focus_handle: FocusHandle,
     session_counter: usize,
     /// Connection to the session daemon (owns PTYs).
-    client: Arc<GuiClient>,
+    pub(crate) client: Arc<GuiClient>,
     /// Highest grid frame seq acked back to the daemon (send-window flow
     /// control; see `runtime::outqueue`).
     acked_grid_seq: u64,
@@ -264,8 +266,12 @@ pub struct SeanceApp {
     workspace_unread: std::collections::HashMap<String, WorkspaceAttention>,
     /// Full-window live overview (ctrl+shift+space).
     overview: bool,
-    /// This window attached with an empty subscription set (second process).
-    empty_window: bool,
+    /// Which circles this OS window shows (main / blank / one workspace).
+    window_scope: window_hotkeys::WindowScope,
+    /// Dedicated window: bound slug still exists in the daemon catalog.
+    scoped_target_available: bool,
+    /// This window's GPUI handle (for per-window close / visibility).
+    own_window: gpui::AnyWindowHandle,
     /// Quicklaunch strip entries (~/.config/seance/quicklaunch.json).
     quicklaunch: Vec<QuickLaunchEntry>,
     /// Daemon-side mtime_ms of the config at last load — reload only on
@@ -404,26 +410,36 @@ impl RenderProbe {
 
 impl SeanceApp {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        Self::new_inner(window, cx, false)
+        Self::new_inner(window, cx, window_hotkeys::WindowScope::Main)
     }
 
     /// Empty window: subscribes to no workspaces until one is selected.
-    /// A second OS window that subscribes to nothing. Its only caller
-    /// ("send to new window") went with the ownership model; phase 2's
-    /// sidebar re-wires it as "open a window here".
     #[allow(dead_code)]
     pub fn new_empty_window(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        Self::new_inner(window, cx, true)
+        Self::new_inner(window, cx, window_hotkeys::WindowScope::Blank)
     }
 
-    fn new_inner(window: &mut Window, cx: &mut Context<Self>, empty: bool) -> Self {
+    pub fn new_workspace_window(window: &mut Window, cx: &mut Context<Self>, slug: &str) -> Self {
+        Self::new_inner(
+            window,
+            cx,
+            window_hotkeys::WindowScope::Workspace(slug.to_string()),
+        )
+    }
+
+    fn new_inner(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        scope: window_hotkeys::WindowScope,
+    ) -> Self {
+        let empty = scope.is_blank();
         // Connect to the session daemon (PTYs live there).
         let pref = if empty {
             None
         } else {
             crate::subscriptions_pref::load()
         };
-        let (client, event_rx) = if empty {
+        let (client, event_rx) = if empty || scope.fixed_workspace().is_some() {
             GuiClient::connect_empty().expect("gui client connect empty")
         } else {
             GuiClient::connect().expect("gui client connect to daemon")
@@ -431,6 +447,12 @@ impl SeanceApp {
         // `connect()` decides blank-window on its own (second process /
         // SEANCE_EMPTY_WINDOW); such a window must never persist a list.
         let empty = empty || client.is_empty_window();
+        let scope = if empty && !scope.fixed_workspace().is_some() {
+            window_hotkeys::WindowScope::Blank
+        } else {
+            scope
+        };
+        let scoped_target_available = scope.fixed_workspace().is_none();
         let subs_seeded = pref.is_some() && !empty;
         let remote_cache = Arc::new(crate::remote_cache::RemoteCache::new(Arc::clone(&client)));
 
@@ -485,7 +507,9 @@ impl SeanceApp {
             workspace_names: std::collections::HashMap::new(),
             workspace_unread: std::collections::HashMap::new(),
             overview: false,
-            empty_window: empty,
+            window_scope: scope,
+            scoped_target_available,
+            own_window: window.window_handle(),
             quicklaunch: Vec::new(),
             quicklaunch_mtime: None,
             quicklaunch_checked: None,
@@ -743,7 +767,37 @@ impl SeanceApp {
         })
         .detach();
 
+        match &app.window_scope {
+            window_hotkeys::WindowScope::Main => {
+                window_hotkeys::WindowHotkeys::register_main(cx, app.own_window);
+            }
+            window_hotkeys::WindowScope::Workspace(slug) => {
+                window_hotkeys::WindowHotkeys::register_workspace(cx, slug.clone(), app.own_window);
+            }
+            window_hotkeys::WindowScope::Blank => {}
+        }
         app
+    }
+
+    fn fixed_scope(&self) -> Option<&str> {
+        self.window_scope.fixed_workspace()
+    }
+
+    fn workspace_in_scope(&self, workspace: &str) -> bool {
+        workspaces::workspace_in_window_scope(self.fixed_scope(), workspace)
+    }
+
+    fn slug_in_scope(&self, slug: &str) -> bool {
+        let ws = self
+            .panes
+            .iter()
+            .find(|p| p.slug == slug)
+            .map(|p| p.workspace.as_str());
+        workspaces::slug_in_window_scope(self.fixed_scope(), ws)
+    }
+
+    fn emits_global_notifications(&self, cx: &mut Context<Self>) -> bool {
+        window_hotkeys::WindowHotkeys::is_notification_owner(cx, self.own_window)
     }
 
     fn apply_gui_event_no_window(&mut self, ev: GuiEvent, cx: &mut Context<Self>) {
@@ -766,6 +820,16 @@ impl SeanceApp {
                 // A State means the daemon attached us — whatever it refused
                 // us for last time no longer holds.
                 self.daemon_error = None;
+                let catalog: Vec<(String, String)> = workspace_meta
+                    .iter()
+                    .map(|m| {
+                        (
+                            m.workspace.clone(),
+                            m.name.clone().unwrap_or_else(|| m.workspace.clone()),
+                        )
+                    })
+                    .collect();
+                window_hotkeys::WindowHotkeys::publish_catalog(cx, catalog);
                 // Multi-window identity + peer roster.
                 if let Some(id) = window_id {
                     self.window_id = Some(id);
@@ -773,17 +837,66 @@ impl SeanceApp {
                 self.windows = windows;
                 self.subscriptions = subscriptions;
 
-                // State is global from 0.12 — every workspace, every pane;
-                // nothing is dropped here.
-                let known: std::collections::BTreeSet<String> = panes
-                    .iter()
-                    .map(|p| p.workspace.clone())
-                    .chain(extra_workspaces.iter().cloned())
-                    .chain(workspace_order.iter().cloned())
-                    .chain(workspace_meta.iter().map(|m| m.workspace.clone()))
-                    .chain(selected_workspace.iter().cloned())
-                    .collect();
-                self.reconcile_subscriptions(&known);
+                let fixed_slug = self.window_scope.fixed_workspace().map(str::to_string);
+                let global_known = workspaces::workspace_catalog_from_state(
+                    panes.iter().map(|p| p.workspace.as_str()),
+                    &extra_workspaces,
+                    &workspace_order,
+                    workspace_meta.iter().map(|m| m.workspace.as_str()),
+                    selected_workspace.as_deref(),
+                );
+                self.reconcile_subscriptions(&global_known);
+
+                let panes: Vec<PaneInfo> = if let Some(ws) = fixed_slug.as_deref() {
+                    panes.into_iter().filter(|p| p.workspace == ws).collect()
+                } else {
+                    panes
+                };
+                let extra_workspaces = if let Some(ws) = fixed_slug.as_deref() {
+                    extra_workspaces.into_iter().filter(|w| w == ws).collect()
+                } else {
+                    extra_workspaces
+                };
+                let workspace_order = if let Some(ws) = fixed_slug.as_deref() {
+                    workspace_order.into_iter().filter(|w| w == ws).collect()
+                } else {
+                    workspace_order
+                };
+                let workspace_meta = if let Some(ws) = fixed_slug.as_deref() {
+                    workspace_meta
+                        .into_iter()
+                        .filter(|m| m.workspace == ws)
+                        .collect()
+                } else {
+                    workspace_meta
+                };
+                let asks = if let Some(ws) = fixed_slug.as_deref() {
+                    asks.into_iter()
+                        .filter(|a| a.workspace.as_deref() == Some(ws))
+                        .collect()
+                } else {
+                    asks
+                };
+                let selected_workspace = if let Some(ws) = fixed_slug.as_deref() {
+                    Some(ws.to_string())
+                } else {
+                    selected_workspace
+                };
+
+                let focused_pane = if fixed_slug.is_some() && !self.scoped_target_available {
+                    None
+                } else if fixed_slug.is_some() {
+                    focused_pane.filter(|slug| panes.iter().any(|p| p.slug == *slug))
+                } else {
+                    focused_pane
+                };
+
+                let (panes, extra_workspaces, workspace_order, workspace_meta) =
+                    if fixed_slug.is_some() && !self.scoped_target_available {
+                        (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+                    } else {
+                        (panes, extra_workspaces, workspace_order, workspace_meta)
+                    };
 
                 // Re-seed busy from the daemon's verdict — a full state push is
                 // the resync point for panes whose flips we may have missed
@@ -979,6 +1092,9 @@ impl SeanceApp {
                 }
             }
             GuiEvent::PaneSpawned { pane } => {
+                if !self.workspace_in_scope(&pane.workspace) {
+                    return;
+                }
                 let slug = pane.slug.clone();
                 let ws = pane.workspace.clone();
                 if pane.busy {
@@ -998,6 +1114,9 @@ impl SeanceApp {
                 cx.notify();
             }
             GuiEvent::PaneBusy { pane, busy } => {
+                if !self.slug_in_scope(&pane) {
+                    return;
+                }
                 let changed = if busy {
                     self.busy_panes.insert(pane)
                 } else {
@@ -1011,6 +1130,9 @@ impl SeanceApp {
                 }
             }
             GuiEvent::PaneKilled { slug } => {
+                if !self.slug_in_scope(&slug) {
+                    return;
+                }
                 self.panes.retain(|p| p.slug != slug);
                 self.busy_panes.remove(&slug);
                 self.workspace_focus.retain(|_, s| s != &slug);
@@ -1025,6 +1147,9 @@ impl SeanceApp {
                 cx.notify();
             }
             GuiEvent::PaneExited { slug, exit_code } => {
+                if !self.slug_in_scope(&slug) {
+                    return;
+                }
                 // Tombstone: keep the pane; mark ownership chrome. Explicit
                 // kill still removes via PaneKilled.
                 let entry = self.owners.entry(slug.clone()).or_insert(OwnerChrome {
@@ -1039,7 +1164,16 @@ impl SeanceApp {
                 cx.notify();
             }
             GuiEvent::Ask { ask } => {
-                crate::desktop_notify::ask(&ask.from, &ask.question);
+                if self.emits_global_notifications(cx) {
+                    crate::desktop_notify::ask(&ask.from, &ask.question);
+                }
+                if !ask
+                    .workspace
+                    .as_deref()
+                    .is_none_or(|ws| self.workspace_in_scope(ws))
+                {
+                    return;
+                }
                 self.asks.push(PendingAsk {
                     id: ask.id,
                     from: ask.from,
@@ -1051,19 +1185,37 @@ impl SeanceApp {
                 cx.notify();
             }
             GuiEvent::AskResolved { id } => {
+                if !self.asks.iter().any(|a| a.id == id) {
+                    return;
+                }
                 self.asks.retain(|a| a.id != id);
                 cx.notify();
             }
             GuiEvent::Status { slug, state, note } => {
+                if !self.slug_in_scope(&slug) {
+                    if self.emits_global_notifications(cx)
+                        && (state == "needs-human" || state == "blocked")
+                    {
+                        crate::desktop_notify::needs_human(&slug, note.as_deref());
+                        telegram_status_bridge(
+                            Arc::clone(&self.client),
+                            &slug,
+                            &state,
+                            note.as_deref(),
+                        );
+                    }
+                    return;
+                }
                 if state == "needs-human" || state == "blocked" {
-                    crate::desktop_notify::needs_human(&slug, note.as_deref());
-                    // If this pane is phoned to telegram, post a one-liner.
-                    telegram_status_bridge(
-                        Arc::clone(&self.client),
-                        &slug,
-                        &state,
-                        note.as_deref(),
-                    );
+                    if self.emits_global_notifications(cx) {
+                        crate::desktop_notify::needs_human(&slug, note.as_deref());
+                        telegram_status_bridge(
+                            Arc::clone(&self.client),
+                            &slug,
+                            &state,
+                            note.as_deref(),
+                        );
+                    }
                 }
                 self.note_workspace_status_event(&slug, &state);
                 self.statuses.insert(slug, PaneStatus { state, note });
@@ -1074,9 +1226,15 @@ impl SeanceApp {
                 cx.notify();
             }
             GuiEvent::Touch { slug, verb, actor } => {
+                if !self.slug_in_scope(&slug) {
+                    return;
+                }
                 self.touch(&slug, &verb, &actor, cx);
             }
             GuiEvent::InputOrigin { pane, origin } => {
+                if !self.slug_in_scope(&pane) {
+                    return;
+                }
                 // Real input (keystroke / inject / propose) bumps workspace
                 // recency for sidebar auto-sort. Focus/select alone never
                 // emits InputOrigin.
@@ -1107,6 +1265,9 @@ impl SeanceApp {
                 exited,
                 exit_code,
             } => {
+                if !self.slug_in_scope(&pane) {
+                    return;
+                }
                 self.owners.insert(
                     pane.clone(),
                     OwnerChrome {
@@ -1120,6 +1281,9 @@ impl SeanceApp {
                 cx.notify();
             }
             GuiEvent::Ghost { pane, ghost } => {
+                if !self.slug_in_scope(&pane) {
+                    return;
+                }
                 if let Some(rt) = self
                     .panes
                     .iter()
@@ -1134,6 +1298,9 @@ impl SeanceApp {
                 workspace,
                 last_output_ms,
             } => {
+                if !self.workspace_in_scope(&workspace) {
+                    return;
+                }
                 // Daemon says this circle produced real output. Max-merge:
                 // a local stamp from a frame we just painted may be newer.
                 let cur = self
@@ -1151,7 +1318,14 @@ impl SeanceApp {
                 // reconnect (the supervisor would just re-register us).
                 eprintln!("[seance gui] closed remotely by {by}");
                 self.client.disconnect();
-                cx.quit();
+                let handle = self.own_window;
+                let scope = self.window_scope.clone();
+                cx.defer(move |cx| {
+                    if matches!(scope, window_hotkeys::WindowScope::Main) {
+                        window_hotkeys::WindowHotkeys::clear_main(cx);
+                    }
+                    let _ = handle.update(cx, |_, window, _| window.remove_window());
+                });
             }
             GuiEvent::Error { message } => {
                 eprintln!("[seance gui] daemon error: {message}");
@@ -1213,6 +1387,9 @@ impl SeanceApp {
     /// stay correct without the old 90%+ CPU tax from spinning TUIs.
     fn apply_grid_snap(&mut self, snap: GridSnapshot, cx: &mut Context<Self>) {
         let slug = snap.pane.clone();
+        if self.fixed_scope().is_some() && !self.panes.iter().any(|p| p.slug == slug) {
+            return;
+        }
         // Time-since-activity stamps ONLY on real content change. Attach /
         // pull / relaunch / workspace-switch all re-push FULL frames with
         // identical (or first-seen) content — those must not reset the clock.
@@ -1628,6 +1805,9 @@ impl SeanceApp {
     }
 
     fn ensure_remote_pane_cx(&mut self, info: &PaneInfo, cx: &mut Context<Self>) {
+        if !self.workspace_in_scope(&info.workspace) {
+            return;
+        }
         if self.panes.iter().any(|p| p.slug == info.slug) {
             if let Some(p) = self.panes.iter_mut().find(|p| p.slug == info.slug) {
                 p.name = info.name.clone();
@@ -2030,6 +2210,11 @@ impl SeanceApp {
     }
 
     fn set_active(&mut self, slug: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(pane) = self.panes.iter().find(|p| p.slug == slug) {
+            if !self.workspace_in_scope(&pane.workspace) {
+                return;
+            }
+        }
         if self.active_slug.as_deref() != Some(slug) {
             let ws = self
                 .panes
@@ -2619,6 +2804,9 @@ impl Render for SeanceApp {
                 this.move_to_workspace(&act.slug.clone(), &act.workspace.clone(), cx);
             }))
             .on_action(cx.listener(|this, act: &ActMoveToNewWorkspace, _, cx| {
+                if this.window_scope.fixed_workspace().is_some() {
+                    return;
+                }
                 let n = this.known_workspace_names().len() + 1;
                 this.move_to_workspace(&act.0.clone(), &format!("circle-{n}"), cx);
             }))

@@ -1,4 +1,4 @@
-//! Desktop settings window — font + global shortcuts (device-local prefs).
+//! Desktop settings window — font, colors, shortcuts (device-local prefs).
 
 use std::collections::HashSet;
 use std::sync::Mutex;
@@ -8,12 +8,16 @@ use gpui::{
     div, prelude::*, px, AnyWindowHandle, App, Context, FocusHandle, Focusable, Render,
     SharedString, Window,
 };
+use gpui_component::input::{Input, InputEvent, InputState};
 
+use super::colors::{self, ColorScheme, ImportResult};
 use super::preferences::{
-    self, adjust_font_size, apply_font_from_settings, chords_for_action, clamp_font_size,
-    desktop_prefs, reset_action, reset_all_shortcuts, reset_font_defaults,
-    reset_terminal_font_size, save_error, try_bind, AppAction, BindError,
+    self, adjust_font_size, apply_color_scheme_from_settings, apply_font_from_settings,
+    chords_for_action, clamp_font_size, desktop_prefs, reset_action, reset_all_shortcuts,
+    reset_color_scheme_defaults, reset_font_defaults, reset_terminal_font_size, save_error,
+    try_bind, AppAction, BindError, Chord,
 };
+use super::window_hotkeys::{self, SettingsCapture, WindowHotkeys};
 use super::SeanceApp;
 use crate::term_font;
 
@@ -44,8 +48,36 @@ pub fn focus_existing_settings(cx: &mut App) -> bool {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SettingsPage {
     Font,
+    Colors,
     Keyboard,
+    Windows,
 }
+
+const COLOR_FIELD_LABELS: [&str; 23] = [
+    "Foreground",
+    "Background",
+    "Cursor",
+    "Cursor text",
+    "Selection background",
+    "Selection foreground",
+    "Bold (optional)",
+    "ANSI 0",
+    "ANSI 1",
+    "ANSI 2",
+    "ANSI 3",
+    "ANSI 4",
+    "ANSI 5",
+    "ANSI 6",
+    "ANSI 7",
+    "ANSI 8",
+    "ANSI 9",
+    "ANSI 10",
+    "ANSI 11",
+    "ANSI 12",
+    "ANSI 13",
+    "ANSI 14",
+    "ANSI 15",
+];
 
 /// Separate window so capture never leaks into live PTYs.
 pub struct SettingsWindow {
@@ -55,15 +87,26 @@ pub struct SettingsWindow {
     draft_size: f32,
     monospace_fonts: Vec<String>,
     capture: Option<AppAction>,
+    windows_capture: Option<SettingsCapture>,
     bind_error: Option<String>,
+    row_error: Option<String>,
     polled_save_err: Option<String>,
     installed: HashSet<String>,
+    pick_workspace: String,
+    color_fields: Vec<(SharedString, gpui::Entity<InputState>)>,
+    color_apply_error: Option<String>,
+    color_import_busy: bool,
+    color_import_error: Option<String>,
+    color_import_warnings: Vec<String>,
+    color_import_profiles: Vec<ColorScheme>,
+    color_import_idx: usize,
 }
 
 impl SettingsWindow {
-    pub fn new(_window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let installed: HashSet<String> = cx.text_system().all_font_names().into_iter().collect();
         let prefs = desktop_prefs().read().unwrap().clone();
+        let color_fields = Self::make_color_field_inputs(window, cx, &prefs.terminal_color_scheme);
         let mut monospace_fonts = installed
             .iter()
             .filter(|name| term_font::probe_monospace(cx.text_system(), name, prefs.font_size))
@@ -96,10 +139,124 @@ impl SettingsWindow {
             draft_size: prefs.font_size,
             monospace_fonts,
             capture: None,
+            windows_capture: None,
             bind_error: None,
+            row_error: None,
             polled_save_err,
             installed,
+            pick_workspace: String::new(),
+            color_fields,
+            color_apply_error: None,
+            color_import_busy: false,
+            color_import_error: None,
+            color_import_warnings: Vec::new(),
+            color_import_profiles: Vec::new(),
+            color_import_idx: 0,
         }
+    }
+
+    fn make_color_field_inputs(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        scheme: &ColorScheme,
+    ) -> Vec<(SharedString, gpui::Entity<InputState>)> {
+        let values = color_scheme_to_field_hex(scheme);
+        COLOR_FIELD_LABELS
+            .iter()
+            .zip(values)
+            .map(|(label, value)| {
+                let input = cx.new(|cx| InputState::new(window, cx).default_value(value));
+                cx.subscribe(&input, |this, _, event, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        this.color_apply_error = None;
+                        cx.notify();
+                    }
+                })
+                .detach();
+                (SharedString::from(*label), input)
+            })
+            .collect()
+    }
+
+    fn sync_color_fields_from_scheme(&self, scheme: ColorScheme, cx: &mut Context<Self>) {
+        let values = color_scheme_to_field_hex(&scheme);
+        let handle = SETTINGS_WINDOW.lock().ok().and_then(|g| g.clone());
+        let Some(handle) = handle else {
+            return;
+        };
+        let inputs = self.color_fields.clone();
+        cx.defer(move |cx| {
+            let _ = cx.update_window(handle, |_, window, cx| {
+                for ((_, input), value) in inputs.iter().zip(values) {
+                    input.update(cx, |state, cx| {
+                        state.set_value(value, window, cx);
+                    });
+                }
+            });
+        });
+    }
+
+    fn read_color_scheme_from_fields(&self, cx: &App) -> Result<ColorScheme, String> {
+        let mut values = Vec::with_capacity(COLOR_FIELD_LABELS.len());
+        for (_, input) in &self.color_fields {
+            values.push(input.read(cx).value().to_string());
+        }
+        let ansi: [String; 16] = std::array::from_fn(|i| values[7 + i].clone());
+        colors::color_scheme_from_fields(
+            "Custom", &values[0], &values[1], &ansi, &values[2], &values[3], &values[4],
+            &values[5], &values[6],
+        )
+    }
+
+    pub fn complete_hotkey_capture(
+        &mut self,
+        capture: SettingsCapture,
+        chord: Option<Chord>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.windows_capture.as_ref() != Some(&capture) {
+            return;
+        }
+        let is_app_capture = matches!(capture, SettingsCapture::AppShortcut(_));
+        let result = match capture {
+            SettingsCapture::MainWindow => {
+                window_hotkeys::WindowHotkeys::bind_main(cx, chord.clone())
+            }
+            SettingsCapture::WorkspaceRow(i) => {
+                window_hotkeys::WindowHotkeys::bind_workspace(cx, i, chord.clone())
+            }
+            SettingsCapture::AppShortcut(action) => {
+                if let Some(c) = chord {
+                    try_bind(action, vec![c], cfg!(target_os = "macos")).map_err(|e| match e {
+                        BindError::ConflictWindowHotkey => {
+                            window_hotkeys::WindowHotkeyError::ConflictWindow(
+                                "a window show/hide hotkey".into(),
+                            )
+                        }
+                        BindError::Conflict(a) => window_hotkeys::WindowHotkeyError::ConflictApp(a),
+                        BindError::Protected => window_hotkeys::WindowHotkeyError::UnsupportedChord,
+                        BindError::UnsafeBareKey => {
+                            window_hotkeys::WindowHotkeyError::UnsupportedChord
+                        }
+                    })
+                } else {
+                    Err(window_hotkeys::WindowHotkeyError::UnsupportedChord)
+                }
+            }
+        };
+        match result {
+            Ok(()) => {
+                self.capture = None;
+                self.windows_capture = None;
+                let weak = cx.weak_entity();
+                window_hotkeys::WindowHotkeys::set_settings_recorder(cx, weak, None, None);
+                self.row_error = None;
+                self.bind_error = None;
+            }
+            Err(e) if is_app_capture => self.bind_error = Some(e.message()),
+            Err(e) => self.row_error = Some(e.message()),
+        }
+        cx.notify();
     }
 }
 
@@ -114,6 +271,22 @@ impl Render for SettingsWindow {
         let mac = cfg!(target_os = "macos");
         let save_err = self.polled_save_err.clone().or_else(save_error);
         let page = self.page;
+        let windows_err = if page == SettingsPage::Windows {
+            self.row_error
+                .clone()
+                .or_else(|| WindowHotkeys::last_error(cx))
+        } else {
+            None
+        };
+        let keyboard_err = if page == SettingsPage::Keyboard {
+            self.bind_error.clone()
+        } else {
+            None
+        };
+        let color_err = self
+            .color_apply_error
+            .clone()
+            .or_else(|| self.color_import_error.clone());
 
         div()
             .id("settings-window")
@@ -125,36 +298,23 @@ impl Render for SettingsWindow {
             .track_focus(&self.focus_handle)
             .capture_key_down(
                 cx.listener(|this, event: &gpui::KeyDownEvent, _window, cx| {
-                    if this.capture.is_some() {
+                    if this.capture.is_some() || this.windows_capture.is_some() {
                         if event.keystroke.key == "escape" {
                             this.capture = None;
+                            this.windows_capture = None;
                             this.bind_error = None;
+                            this.row_error = None;
+                            let weak = cx.weak_entity();
+                            window_hotkeys::WindowHotkeys::set_settings_recorder(
+                                cx, weak, None, None,
+                            );
                             cx.notify();
                             cx.stop_propagation();
                             return;
                         }
-                        let action = this.capture;
                         let chord = preferences::keystroke_to_chord(&event.keystroke);
-                        if let Some(action) = action {
-                            match try_bind(action, vec![chord], cfg!(target_os = "macos")) {
-                                Ok(()) => {
-                                    this.capture = None;
-                                    this.bind_error = None;
-                                }
-                                Err(BindError::Protected) => {
-                                    this.bind_error = Some("That chord is reserved.".into());
-                                }
-                                Err(BindError::UnsafeBareKey) => {
-                                    this.bind_error = Some(
-                                        "Use a modifier chord — bare keys belong in terminals."
-                                            .into(),
-                                    );
-                                }
-                                Err(BindError::Conflict(other)) => {
-                                    this.bind_error =
-                                        Some(format!("Already used by “{}”.", other.label()));
-                                }
-                            }
+                        if let Some(wcap) = this.windows_capture.clone() {
+                            this.complete_hotkey_capture(wcap, Some(chord), cx);
                         }
                         cx.notify();
                         cx.stop_propagation();
@@ -187,6 +347,17 @@ impl Render for SettingsWindow {
                                 cx,
                                 |this, cx| {
                                     this.page = SettingsPage::Font;
+                                    this.clear_capture(cx);
+                                    cx.notify();
+                                },
+                            ))
+                            .child(tab_button(
+                                "Colors",
+                                page == SettingsPage::Colors,
+                                cx,
+                                |this, cx| {
+                                    this.page = SettingsPage::Colors;
+                                    this.clear_capture(cx);
                                     cx.notify();
                                 },
                             ))
@@ -196,11 +367,38 @@ impl Render for SettingsWindow {
                                 cx,
                                 |this, cx| {
                                     this.page = SettingsPage::Keyboard;
+                                    this.clear_capture(cx);
+                                    cx.notify();
+                                },
+                            ))
+                            .child(tab_button(
+                                "Windows",
+                                page == SettingsPage::Windows,
+                                cx,
+                                |this, cx| {
+                                    this.page = SettingsPage::Windows;
+                                    this.clear_capture(cx);
                                     cx.notify();
                                 },
                             )),
                     ),
             )
+            .children({
+                let mut banners = Vec::new();
+                if let Some(msg) = save_err {
+                    banners.push(error_banner(format!("Could not save desktop.json: {msg}")));
+                }
+                if let Some(msg) = windows_err {
+                    banners.push(error_banner(msg));
+                }
+                if let Some(msg) = keyboard_err {
+                    banners.push(error_banner(msg));
+                }
+                if let Some(msg) = color_err {
+                    banners.push(error_banner(msg));
+                }
+                banners
+            })
             .child(
                 div()
                     .id("settings-scroll")
@@ -210,34 +408,43 @@ impl Render for SettingsWindow {
                     .flex()
                     .flex_col()
                     .gap_3()
-                    .children({
-                        let mut top = Vec::new();
-                        if let Some(msg) = save_err {
-                            top.push(
-                                div()
-                                    .text_sm()
-                                    .text_color(SeancePalette::danger())
-                                    .child(format!("Could not save desktop.json: {msg}"))
-                                    .into_any_element(),
-                            );
-                        }
-                        if let Some(msg) = self.bind_error.clone() {
-                            top.push(
-                                div()
-                                    .text_sm()
-                                    .text_color(SeancePalette::danger())
-                                    .child(msg)
-                                    .into_any_element(),
-                            );
-                        }
-                        top
-                    })
                     .children(match page {
                         SettingsPage::Font => self.render_font_page(window, cx),
+                        SettingsPage::Colors => self.render_colors_page(window, cx),
                         SettingsPage::Keyboard => self.render_keyboard_page(mac, cx),
+                        SettingsPage::Windows => self.render_windows_page(mac, cx),
                     }),
             )
     }
+}
+
+fn error_banner(msg: String) -> gpui::AnyElement {
+    div()
+        .flex_none()
+        .px_4()
+        .py_2()
+        .border_b_1()
+        .border_color(SeancePalette::border())
+        .text_sm()
+        .text_color(SeancePalette::danger())
+        .child(msg)
+        .into_any_element()
+}
+
+fn color_scheme_to_field_hex(scheme: &ColorScheme) -> Vec<String> {
+    let mut out = vec![
+        scheme.foreground.to_hex(),
+        scheme.background.to_hex(),
+        scheme.cursor.to_hex(),
+        scheme.cursor_text.to_hex(),
+        scheme.selection_background.to_hex(),
+        scheme.selection_foreground.to_hex(),
+        scheme.bold.map(|b| b.to_hex()).unwrap_or_default(),
+    ];
+    for a in &scheme.ansi {
+        out.push(a.to_hex());
+    }
+    out
 }
 
 fn tab_button(
@@ -269,6 +476,15 @@ fn tab_button(
 }
 
 impl SettingsWindow {
+    fn clear_capture(&mut self, cx: &mut Context<Self>) {
+        self.capture = None;
+        self.windows_capture = None;
+        self.bind_error = None;
+        self.row_error = None;
+        let weak = cx.weak_entity();
+        window_hotkeys::WindowHotkeys::set_settings_recorder(cx, weak, None, None);
+    }
+
     fn render_font_page(
         &mut self,
         _window: &mut Window,
@@ -309,11 +525,20 @@ impl SettingsWindow {
                             SeancePalette::bg_elevated()
                         })
                         .text_sm()
+                        .text_color(if active {
+                            SeancePalette::flame()
+                        } else {
+                            SeancePalette::text()
+                        })
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.draft_family = pick.clone();
                             cx.notify();
                         }))
-                        .child(family)
+                        .child(if active {
+                            format!("✓ {family}")
+                        } else {
+                            family
+                        })
                         .into_any_element()
                 }))
                 .into_any_element(),
@@ -378,6 +603,253 @@ impl SettingsWindow {
         ]
     }
 
+    fn render_colors_page(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
+        let preview_scheme = self.read_color_scheme_from_fields(cx).unwrap_or_default();
+        let preview_font = term_font::term_font();
+        let preview_size = desktop_prefs().read().unwrap().font_size;
+        let mut rows = Vec::new();
+        rows.push(
+            div()
+                .text_sm()
+                .text_color(SeancePalette::text_dim())
+                .child("Terminal colors for panes, popouts, and overview thumbs. App chrome stays candlelit until you Apply.")
+                .into_any_element(),
+        );
+        if self.color_import_busy {
+            rows.push(
+                div()
+                    .text_sm()
+                    .text_color(SeancePalette::text_dim())
+                    .child("Loading import…")
+                    .into_any_element(),
+            );
+        }
+        for w in &self.color_import_warnings {
+            rows.push(
+                div()
+                    .text_xs()
+                    .text_color(SeancePalette::text_faint())
+                    .child(w.clone())
+                    .into_any_element(),
+            );
+        }
+        if !self.color_import_profiles.is_empty() {
+            rows.push(
+                div()
+                    .text_sm()
+                    .text_color(SeancePalette::text_dim())
+                    .child("Imported profiles — pick one to load into the draft (not applied until Apply):")
+                    .into_any_element(),
+            );
+            for (i, scheme) in self.color_import_profiles.iter().enumerate() {
+                let name = if scheme.name.is_empty() {
+                    format!("Profile {}", i + 1)
+                } else {
+                    scheme.name.clone()
+                };
+                let active = i == self.color_import_idx;
+                let idx = i;
+                rows.push(
+                    div()
+                        .id(SharedString::from(format!("color-import-{i}")))
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .bg(if active {
+                            SeancePalette::surface()
+                        } else {
+                            SeancePalette::bg_elevated()
+                        })
+                        .text_sm()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.color_import_idx = idx;
+                            if let Some(scheme) = this.color_import_profiles.get(idx).cloned() {
+                                this.sync_color_fields_from_scheme(scheme, cx);
+                            }
+                            this.color_apply_error = None;
+                            cx.notify();
+                        }))
+                        .child(name)
+                        .into_any_element(),
+                );
+            }
+        }
+        for (label, input) in &self.color_fields {
+            let hex = input.read(cx).value().to_string();
+            let swatch = colors::Rgb24::from_hex(&hex)
+                .ok()
+                .map(colors::rgb24_to_hsla)
+                .unwrap_or(SeancePalette::surface());
+            rows.push(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .w_32()
+                            .text_xs()
+                            .text_color(SeancePalette::text_faint())
+                            .child(label.clone()),
+                    )
+                    .child(
+                        div()
+                            .size(px(18.))
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(SeancePalette::border())
+                            .bg(swatch),
+                    )
+                    .child(div().flex_1().child(Input::new(input)))
+                    .into_any_element(),
+            );
+        }
+        rows.push(
+            div()
+                .p_3()
+                .rounded_lg()
+                .bg(colors::rgb24_to_hsla(preview_scheme.background))
+                .text_color(colors::rgb24_to_hsla(preview_scheme.foreground))
+                .font_family(preview_font.family)
+                .font_features(preview_font.features.clone())
+                .text_size(px(preview_size))
+                .child("sample: error success λ fn() — the quick brown fox")
+                .into_any_element(),
+        );
+        rows.push(
+            div()
+                .flex()
+                .flex_wrap()
+                .gap_2()
+                .child(action_button("Apply / Save", cx, move |this, cx| {
+                    match this.read_color_scheme_from_fields(cx) {
+                        Ok(scheme) => match apply_color_scheme_from_settings(scheme) {
+                            Ok(()) => {
+                                this.color_apply_error = None;
+                                cx.refresh_windows();
+                            }
+                            Err(e) => this.color_apply_error = Some(e),
+                        },
+                        Err(e) => this.color_apply_error = Some(e),
+                    }
+                    cx.notify();
+                }))
+                .child(action_button("Reset draft", cx, move |this, cx| {
+                    let scheme = desktop_prefs()
+                        .read()
+                        .unwrap()
+                        .terminal_color_scheme
+                        .clone();
+                    this.sync_color_fields_from_scheme(scheme, cx);
+                    this.color_apply_error = None;
+                    cx.notify();
+                }))
+                .child(action_button("Restore defaults", cx, move |this, cx| {
+                    reset_color_scheme_defaults();
+                    let scheme = desktop_prefs()
+                        .read()
+                        .unwrap()
+                        .terminal_color_scheme
+                        .clone();
+                    this.sync_color_fields_from_scheme(scheme, cx);
+                    this.color_apply_error = None;
+                    cx.refresh_windows();
+                    cx.notify();
+                }))
+                .child(action_button("Import file…", cx, move |this, cx| {
+                    this.start_color_file_import(cx);
+                }))
+                .child(action_button(
+                    "Import installed iTerm2…",
+                    cx,
+                    move |this, cx| {
+                        this.start_installed_iterm_import(cx);
+                    },
+                ))
+                .into_any_element(),
+        );
+        rows
+    }
+
+    fn start_color_file_import(&mut self, cx: &mut Context<Self>) {
+        use gpui::PathPromptOptions;
+        self.color_import_error = None;
+        self.color_import_busy = true;
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Import iTerm2 colors".into()),
+        });
+        let weak = cx.weak_entity();
+        cx.spawn(async move |_, cx| {
+            let picked = match rx.await {
+                Ok(Ok(Some(paths))) => paths.first().cloned(),
+                _ => None,
+            };
+            let result = picked.map(|path| {
+                colors::read_import_file_capped(&path).and_then(|bytes| {
+                    colors::parse_iterm(&bytes, &path.to_string_lossy(), &ColorScheme::default())
+                })
+            });
+            if let Some(view) = weak.upgrade() {
+                view.update(cx, |this, cx| {
+                    this.color_import_busy = false;
+                    match result {
+                        None => {}
+                        Some(Ok(import)) => this.finish_color_import(import),
+                        Some(Err(e)) => {
+                            this.color_import_error = Some(e);
+                            this.color_import_profiles.clear();
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn start_installed_iterm_import(&mut self, cx: &mut Context<Self>) {
+        self.color_import_error = None;
+        self.color_import_busy = true;
+        let weak = cx.weak_entity();
+        cx.spawn(async move |_, cx| {
+            let import = cx
+                .background_executor()
+                .spawn(async { colors::load_installed_iterm(&ColorScheme::default()) })
+                .await;
+            if let Some(view) = weak.upgrade() {
+                view.update(cx, |this, cx| {
+                    this.color_import_busy = false;
+                    match import {
+                        Ok(import) => this.finish_color_import(import),
+                        Err(e) => {
+                            this.color_import_error = Some(e);
+                            this.color_import_profiles.clear();
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn finish_color_import(&mut self, import: ImportResult) {
+        self.color_import_warnings = import.warnings;
+        self.color_import_profiles = import.schemes;
+        self.color_import_idx = 0;
+        if self.color_import_profiles.is_empty() {
+            self.color_import_error = Some("No color profiles found in import.".into());
+        }
+    }
+
     fn render_keyboard_page(&self, mac: bool, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
         let prefs = desktop_prefs().read().unwrap().clone();
         let mut rows = Vec::new();
@@ -410,23 +882,31 @@ impl SettingsWindow {
                     .py_1()
                     .border_b_1()
                     .border_color(SeancePalette::border().opacity(0.35))
-                    .child(div().flex_1().text_sm().child(label))
-                    .child(div().text_xs().text_color(SeancePalette::text_dim()).child(
-                        if capturing {
-                            "Press chord… (Esc cancel)".into()
-                        } else {
-                            chord_text
-                        },
-                    ))
+                    .child(div().flex_1().min_w_0().text_sm().child(label))
+                    .child(
+                        div()
+                            .flex_none()
+                            .max_w(px(220.))
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .text_xs()
+                            .text_color(SeancePalette::text_dim())
+                            .child(if capturing {
+                                "Press chord… (Esc cancel)".into()
+                            } else {
+                                chord_text
+                            }),
+                    )
                     .child(shortcut_button(
                         &format!("change-{action_id}"),
                         "Change",
                         cx,
                         move |this, window, cx| {
-                            this.capture = Some(*action);
-                            this.bind_error = None;
-                            window.focus(&this.focus_handle, cx);
-                            cx.notify();
+                            this.start_windows_capture(
+                                SettingsCapture::AppShortcut(*action),
+                                window,
+                                cx,
+                            );
                         },
                     ))
                     .child(shortcut_button(
@@ -451,6 +931,10 @@ impl SettingsWindow {
                                             .into(),
                                     );
                                 }
+                                Err(BindError::ConflictWindowHotkey) => {
+                                    this.bind_error =
+                                        Some("Already used by a window show/hide hotkey.".into());
+                                }
                             }
                             cx.notify();
                         },
@@ -464,8 +948,30 @@ impl SettingsWindow {
                 .child(action_button(
                     "Restore all keyboard defaults",
                     cx,
-                    |_, cx| {
-                        reset_all_shortcuts();
+                    |this, cx| {
+                        match reset_all_shortcuts() {
+                            Ok(()) => this.bind_error = None,
+                            Err(BindError::Conflict(other)) => {
+                                this.bind_error = Some(format!(
+                                    "Cannot reset all: “{}” still uses a default chord.",
+                                    other.label()
+                                ));
+                            }
+                            Err(BindError::ConflictWindowHotkey) => {
+                                this.bind_error = Some(
+                                    "Cannot reset all: a window show/hide hotkey uses a default chord."
+                                        .into(),
+                                );
+                            }
+                            Err(BindError::Protected) => {
+                                this.bind_error = Some("That chord is reserved.".into());
+                            }
+                            Err(BindError::UnsafeBareKey) => {
+                                this.bind_error = Some(
+                                    "Use a modifier chord — bare keys belong in terminals.".into(),
+                                );
+                            }
+                        }
                         cx.notify();
                     },
                 ))
@@ -473,6 +979,259 @@ impl SettingsWindow {
         );
         rows
     }
+
+    fn render_windows_page(&mut self, mac: bool, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
+        let supported = window_hotkeys::WindowHotkeys::platform_supported();
+        let prefs = desktop_prefs().read().unwrap().clone();
+        let catalog = WindowHotkeys::catalog(cx);
+        let mut rows = Vec::new();
+        if !supported {
+            rows.push(
+                div()
+                    .text_sm()
+                    .text_color(SeancePalette::text_dim())
+                    .child("Global window hotkeys are only supported on macOS. Definitions are saved but not registered on this platform.")
+                    .into_any_element(),
+            );
+        }
+        let main_label = prefs
+            .main_window_hotkey
+            .as_ref()
+            .map(|c| c.display(mac))
+            .unwrap_or_else(|| "Unassigned".into());
+        let main_cap = self.windows_capture == Some(SettingsCapture::MainWindow);
+        rows.push(
+            div()
+                .text_sm()
+                .text_color(SeancePalette::text_dim())
+                .child("System-wide show/hide for the primary Seance window.")
+                .into_any_element(),
+        );
+        rows.push(window_row(
+            "Main window",
+            &main_label,
+            main_cap,
+            cx,
+            |this, window, cx| {
+                this.start_windows_capture(SettingsCapture::MainWindow, window, cx);
+            },
+            |this, cx| {
+                let _ = WindowHotkeys::bind_main(cx, None);
+                this.row_error = None;
+                cx.notify();
+            },
+            |_this, cx| {
+                WindowHotkeys::open_or_toggle_main(cx);
+                cx.notify();
+            },
+        ));
+        rows.push(
+            div()
+                .pt_2()
+                .text_sm()
+                .text_color(SeancePalette::text_dim())
+                .child("Dedicated workspace windows — each stays on one circle.")
+                .into_any_element(),
+        );
+        let pick = if self.pick_workspace.is_empty() {
+            catalog.first().map(|(s, _)| s.clone()).unwrap_or_default()
+        } else {
+            self.pick_workspace.clone()
+        };
+        rows.push(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(div().text_sm().child("Circle for new window:"))
+                .children(catalog.iter().map(|(slug, label)| {
+                    let active = pick == *slug;
+                    let pick_slug = slug.clone();
+                    div()
+                        .id(SharedString::from(format!("ws-pick-{slug}")))
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .bg(if active {
+                            SeancePalette::surface()
+                        } else {
+                            SeancePalette::bg_elevated()
+                        })
+                        .text_sm()
+                        .text_color(if active {
+                            SeancePalette::flame()
+                        } else {
+                            SeancePalette::text()
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.pick_workspace = pick_slug.clone();
+                            this.row_error = None;
+                            cx.notify();
+                        }))
+                        .child(if active {
+                            format!("✓ {label}")
+                        } else {
+                            label.clone()
+                        })
+                        .into_any_element()
+                }))
+                .child(action_button("Add window", cx, |this, cx| {
+                    let pick = if this.pick_workspace.is_empty() {
+                        WindowHotkeys::catalog(cx)
+                            .first()
+                            .map(|(s, _)| s.clone())
+                            .unwrap_or_default()
+                    } else {
+                        this.pick_workspace.clone()
+                    };
+                    if pick.is_empty() {
+                        this.row_error = Some("Choose a workspace first.".into());
+                    } else if let Err(e) = WindowHotkeys::add_workspace_definition(cx, pick.clone())
+                    {
+                        this.row_error = Some(e);
+                    } else {
+                        this.row_error = None;
+                        window_hotkeys::open_workspace_window(cx, pick.clone());
+                    }
+                    cx.notify();
+                }))
+                .into_any_element(),
+        );
+        for (i, def) in prefs.workspace_windows.iter().enumerate() {
+            let label = catalog
+                .iter()
+                .find(|(s, _)| s == &def.workspace)
+                .map(|(_, l)| l.as_str())
+                .unwrap_or(def.workspace.as_str());
+            let chord = def
+                .shortcut
+                .as_ref()
+                .map(|c| c.display(mac))
+                .unwrap_or_else(|| "Unassigned".into());
+            let cap = self.windows_capture == Some(SettingsCapture::WorkspaceRow(i));
+            let idx = i;
+            rows.push(window_row(
+                label,
+                &chord,
+                cap,
+                cx,
+                move |this, window, cx| {
+                    this.start_windows_capture(SettingsCapture::WorkspaceRow(idx), window, cx);
+                },
+                move |this, cx| {
+                    let _ = WindowHotkeys::bind_workspace(cx, idx, None);
+                    this.row_error = None;
+                    cx.notify();
+                },
+                move |_this, cx| {
+                    WindowHotkeys::open_or_toggle_workspace(cx, idx);
+                    cx.notify();
+                },
+            ));
+            rows.push(
+                div()
+                    .pb_2()
+                    .child(action_button("Remove window", cx, move |this, cx| {
+                        this.clear_capture(cx);
+                        WindowHotkeys::remove_workspace_definition(cx, idx);
+                        this.row_error = None;
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+        }
+        rows
+    }
+
+    fn start_windows_capture(
+        &mut self,
+        capture: SettingsCapture,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.capture = match &capture {
+            SettingsCapture::AppShortcut(action) => Some(*action),
+            _ => None,
+        };
+        let cap = capture.clone();
+        self.windows_capture = Some(capture);
+        self.row_error = None;
+        self.bind_error = None;
+        let weak = cx.weak_entity();
+        window_hotkeys::WindowHotkeys::set_settings_recorder(cx, weak, Some(cap), None);
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+}
+
+fn window_row(
+    label: &str,
+    chord: &str,
+    capturing: bool,
+    cx: &mut Context<SettingsWindow>,
+    on_bind: impl Fn(&mut SettingsWindow, &mut Window, &mut Context<SettingsWindow>) + 'static,
+    on_clear: impl Fn(&mut SettingsWindow, &mut Context<SettingsWindow>) + 'static,
+    on_toggle: impl Fn(&mut SettingsWindow, &mut Context<SettingsWindow>) + 'static,
+) -> gpui::AnyElement {
+    let label = label.to_string();
+    let chord = chord.to_string();
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .py_1()
+        .border_b_1()
+        .border_color(SeancePalette::border().opacity(0.35))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .flex_1()
+                        .text_sm()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(SeancePalette::text_dim())
+                        .child(if capturing {
+                            "Press chord… (Esc cancel)".into()
+                        } else {
+                            chord
+                        }),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .gap_2()
+                .child(shortcut_button(
+                    "bind",
+                    "Bind",
+                    cx,
+                    move |this, window, cx| {
+                        on_bind(this, window, cx);
+                    },
+                ))
+                .child(shortcut_button("clear", "Clear", cx, move |this, _, cx| {
+                    on_clear(this, cx);
+                }))
+                .child(shortcut_button(
+                    "toggle",
+                    "Open / hide",
+                    cx,
+                    move |this, _, cx| {
+                        on_toggle(this, cx);
+                    },
+                )),
+        )
+        .into_any_element()
 }
 
 fn size_button(

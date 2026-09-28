@@ -42,9 +42,11 @@ use web_sys::{
 };
 
 use seance_core::snapshot::GridSnapshot;
+use seance_core::terminal_color::{resolve, DEFAULT_ANSI16, DEFAULT_COLOR};
 
-/// Sentinel meaning "use the theme default" for `CellSnap::fg` / `bg`.
-const DEFAULT_COLOR: u32 = 0xFFFF_FFFF;
+const FG_U32: u32 = 0x00_EB_E3_DB;
+const BG_U32: u32 = 0x00_13_11_11;
+const CURSOR_U32: u32 = 0x00_E9_A0_3A;
 
 // Candlelit palette (docs/THEME.md). Kept as linear-free sRGB f32 triples:
 // the GL surface is not sRGB-encoded, so these go straight to the wire.
@@ -67,14 +69,15 @@ const fn rgb(r: u8, g: u8, b: u8) -> [f32; 3] {
     [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0]
 }
 
-fn unpack(c: u32, default: [f32; 3]) -> [f32; 3] {
+fn unpack(c: u32, default: [f32; 3], default_rgb: u32) -> [f32; 3] {
+    let packed = resolve(c, default_rgb, &DEFAULT_ANSI16, CURSOR_U32);
     if c == DEFAULT_COLOR {
         return default;
     }
     rgb(
-        ((c >> 16) & 0xFF) as u8,
-        ((c >> 8) & 0xFF) as u8,
-        (c & 0xFF) as u8,
+        ((packed >> 16) & 0xFF) as u8,
+        ((packed >> 8) & 0xFF) as u8,
+        (packed & 0xFF) as u8,
     )
 }
 
@@ -403,8 +406,8 @@ impl TermRenderer {
                 };
                 let x = (col as i32 * m.cell_w) as f32;
 
-                let mut fg = unpack(cell.fg, FG);
-                let mut bg = unpack(cell.bg, BG);
+                let mut fg = unpack(cell.fg, FG, FG_U32);
+                let mut bg = unpack(cell.bg, BG, BG_U32);
                 if cell.dim {
                     fg = [fg[0] * DIM_FACTOR, fg[1] * DIM_FACTOR, fg[2] * DIM_FACTOR];
                 }

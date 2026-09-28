@@ -5,6 +5,7 @@
 //! Pure state — no rendering lives here (the sidebar/overview views call
 //! these to compute their layout).
 
+use std::collections::BTreeSet;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -22,6 +23,51 @@ pub(super) const BANISH_ARM: Duration = Duration::from_millis(2000);
 /// two-click window is testable without leaning on a real clock.
 pub(super) fn banish_arm_live(armed: Option<&(String, Instant)>, ws: &str, now: Instant) -> bool {
     armed.is_some_and(|(w, at)| w == ws && now.duration_since(*at) < BANISH_ARM)
+}
+
+/// Authoritative workspace catalog from an unfiltered daemon `State` push.
+pub(super) fn workspace_catalog_from_state(
+    pane_workspaces: impl IntoIterator<Item = impl AsRef<str>>,
+    extra_workspaces: &[String],
+    workspace_order: &[String],
+    meta_workspaces: impl IntoIterator<Item = impl AsRef<str>>,
+    selected_workspace: Option<&str>,
+) -> BTreeSet<String> {
+    let mut known = BTreeSet::new();
+    for w in pane_workspaces {
+        known.insert(w.as_ref().to_string());
+    }
+    known.extend(extra_workspaces.iter().cloned());
+    known.extend(workspace_order.iter().cloned());
+    for w in meta_workspaces {
+        known.insert(w.as_ref().to_string());
+    }
+    if let Some(sel) = selected_workspace {
+        known.insert(sel.to_string());
+    }
+    known
+}
+
+/// Whether an incremental event's workspace belongs in this window's projection.
+pub(super) fn workspace_in_window_scope(fixed: Option<&str>, workspace: &str) -> bool {
+    fixed.is_none_or(|f| workspace == f)
+}
+
+/// Whether a pane slug event should touch local state in a dedicated window.
+pub(super) fn slug_in_window_scope(fixed: Option<&str>, pane_workspace: Option<&str>) -> bool {
+    match fixed {
+        None => true,
+        Some(f) => pane_workspace == Some(f),
+    }
+}
+
+/// Dedicated windows subscribe only when the bound slug is in the global catalog.
+pub(super) fn scoped_window_should_subscribe(
+    target: &str,
+    global_known: &BTreeSet<String>,
+    daemon_subscriptions: &[String],
+) -> bool {
+    global_known.contains(target) && !daemon_subscriptions.iter().any(|s| s == target)
 }
 
 /// Coarse one-unit relative time for sidebar labels.
@@ -196,13 +242,18 @@ impl SeanceApp {
     /// away), so the only reason this still touches subscriptions is catch-up:
     /// a circle created or renamed since the last `State` isn't in the
     /// connection's set until we ask for it.
-    pub(super) fn reconcile_subscriptions(&mut self, known: &std::collections::BTreeSet<String>) {
+    pub(super) fn reconcile_subscriptions(&mut self, global_known: &BTreeSet<String>) {
+        let fixed = self.window_scope.fixed_workspace().map(str::to_string);
+        if let Some(fixed) = fixed {
+            self.reconcile_subscriptions_scoped(&fixed, global_known);
+            return;
+        }
         let subs = self.subscriptions.clone();
         let mut changed = false;
         if !self.subs_seeded {
             // Fresh install: everything that already exists counts as
             // looked-at, so the rail doesn't come up all badged.
-            self.subs_pref.seed_seen(known);
+            self.subs_pref.seed_seen(global_known);
             self.subs_seeded = true;
             changed = true;
         }
@@ -220,7 +271,7 @@ impl SeanceApp {
         let protected = settle_absent(
             &mut self.absent_since,
             referenced.iter().map(String::as_str),
-            known,
+            global_known,
             now_ms(),
         );
         changed |= self.subs_pref.prune(&protected);
@@ -246,8 +297,8 @@ impl SeanceApp {
         }
         // Anything the daemon isn't streaming yet (reconnect, rename, a circle
         // ctl just spawned) gets subscribed so its grids flow.
-        if !self.empty_window {
-            let missing: Vec<String> = known
+        if !self.window_scope.is_blank() {
+            let missing: Vec<String> = global_known
                 .iter()
                 .filter(|w| !subs.iter().any(|s| s == *w))
                 .cloned()
@@ -255,6 +306,23 @@ impl SeanceApp {
             for ws in missing {
                 let _ = self.client.subscribe(&ws);
             }
+        }
+    }
+
+    /// Dedicated workspace window: never seed/prune the shared rail from a
+    /// projected catalog — only catch up subscription for the bound slug.
+    fn reconcile_subscriptions_scoped(&mut self, fixed: &str, global_known: &BTreeSet<String>) {
+        let subs = self.subscriptions.clone();
+        let live = global_known.contains(fixed);
+        self.scoped_target_available = live;
+        if scoped_window_should_subscribe(fixed, global_known, &subs) {
+            let _ = self.client.subscribe(fixed);
+        }
+        if live && self.selected_workspace.as_deref() != Some(fixed) {
+            self.selected_workspace = Some(fixed.to_string());
+            let _ = self.client.set_focus(None, Some(fixed.to_string()));
+        } else if !live {
+            self.selected_workspace = Some(fixed.to_string());
         }
     }
 
@@ -491,6 +559,12 @@ impl SeanceApp {
     ///    circle, or right-click → "touch"). Selecting a workspace alone does
     ///    not bump touch. No manual drag-reorder.
     pub(super) fn workspaces(&self) -> Vec<String> {
+        if let Some(fixed) = self.window_scope.fixed_workspace() {
+            if self.known_workspace_names().contains(fixed) {
+                return vec![fixed.to_string()];
+            }
+            return vec![fixed.to_string()];
+        }
         let mut out: Vec<String> = self.known_workspace_names().into_iter().collect();
         out.sort_by_key(|ws| self.workspace_sort_key(ws));
         out
@@ -745,6 +819,9 @@ impl SeanceApp {
     }
 
     pub(super) fn create_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.window_scope.fixed_workspace().is_some() {
+            return;
+        }
         let existing = self.known_workspace_names();
         let mut n = existing.len() + 1;
         let name = loop {
@@ -779,6 +856,11 @@ impl SeanceApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(fixed) = self.window_scope.fixed_workspace() {
+            if workspace != fixed {
+                return;
+            }
+        }
         let changed = self.selected_workspace.as_deref() != Some(workspace);
         // Selecting is looking — clears the `needs` badge. The daemon
         // auto-subscribes on SetFocus, so nothing to ask for here.
@@ -999,6 +1081,11 @@ impl SeanceApp {
         workspace: &str,
         cx: &mut Context<Self>,
     ) {
+        if let Some(fixed) = self.window_scope.fixed_workspace() {
+            if workspace != fixed {
+                return;
+            }
+        }
         // Append into target workspace (no before-slug) — same path as drag
         // onto a workspace header, so order persists via the daemon.
         self.reorder_pane(slug, workspace, None, cx);
@@ -1075,6 +1162,51 @@ impl SeanceApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_catalog_is_global_before_projection() {
+        let known = workspace_catalog_from_state(
+            ["a", "b"].into_iter(),
+            &["c".into()],
+            &["d".into()],
+            ["e"].into_iter(),
+            Some("f"),
+        );
+        for letter in ["a", "b", "c", "d", "e", "f"] {
+            assert!(known.contains(letter));
+        }
+    }
+
+    #[test]
+    fn bound_workspace_id_is_not_known_without_daemon_evidence() {
+        let known = workspace_catalog_from_state(
+            std::iter::empty::<&str>(),
+            &[],
+            &[],
+            std::iter::empty::<&str>(),
+            None,
+        );
+        assert!(!known.contains("deleted-circle"));
+        assert!(!scoped_window_should_subscribe(
+            "deleted-circle",
+            &known,
+            &[]
+        ));
+    }
+
+    #[test]
+    fn other_workspace_pane_spawn_is_out_of_scope() {
+        assert!(!workspace_in_window_scope(Some("alpha"), "beta"));
+        assert!(workspace_in_window_scope(Some("alpha"), "alpha"));
+        assert!(workspace_in_window_scope(None, "any"));
+    }
+
+    #[test]
+    fn slug_events_ignore_unknown_panes_in_dedicated_windows() {
+        assert!(!slug_in_window_scope(Some("alpha"), Some("beta")));
+        assert!(!slug_in_window_scope(Some("alpha"), None));
+        assert!(slug_in_window_scope(None, None));
+    }
 
     #[test]
     fn group_rename_changes_labels_and_preserves_slugs_and_full_suffixes() {
