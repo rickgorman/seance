@@ -1,32 +1,47 @@
-# Desktop settings verification — 0.26.3
+# Desktop settings verification — 0.26.4
 
-Automated checks pass: `./scripts/check.sh` (478 native tests, formatting,
-zero compiler warnings) and `cargo test --workspace` (699 tests). The release
-app and web assets build successfully. Installed iTerm2 preferences yielded
-three color schemes without import warnings. A live graceful daemon upgrade
-preserved all 43 original terminal processes and session identities.
+`./scripts/check.sh` passes formatting, zero compiler warnings, and 502 native
+tests. The workspace suite passes 723 tests (502 native, 91 core, 130 web).
+The release app and matching web assets build successfully. The web build
+still reports three pre-existing warnings in unchanged web source files.
 
-Font selection, keyboard remapping, Command-minus/equal zoom, sidebar spacing,
-and pane dividers were checked in the desktop app before this release.
+## Verified in the macOS app
 
-## Pending manual checks
+- Colors opens without the former `Root::read` panic. Installed iTerm2 import
+  displays three profiles; choosing one updates the draft. Closing the draft
+  leaves saved colors unchanged.
+- Command-W closes Settings from a focused color field and during shortcut
+  recording. Settings can reopen normally afterward.
+- Two temporary named Seances displayed exactly six and four distinct sidebar
+  tabs. Moving a tab between the open windows changed their lists to seven and
+  three. Renaming preserved membership and the shortcut.
+- Definitions, names, membership, and shortcut assignments survived a GUI
+  restart. Removing the two live test windows returned all 12 original tabs
+  to Main and removed their temporary hotkeys.
+- Overlay is configurable independently for Main and named Seances. Main opens
+  with Overlay persisted. Settings remains correctly scaled and clickable on
+  the external display after that startup, using a native auxiliary panel.
+- All 43 original terminal processes and session identities survived the
+  graceful daemon upgrade, GUI restarts, tab moves, and window removals.
 
-The macOS desktop became unavailable to UI automation (`cgWindowNotFound`
-across applications), so the following checks remain open. GitHub issues are
-disabled on the fork; this file records the follow-up.
+The earlier font, zoom, keyboard remapping, sidebar-spacing, and divider fixes
+were also visually checked. Tests cover color parsing/validation, legacy
+migration, exclusive membership, stable hotkey targets, registration rollback,
+projection, fold preservation, collection flags, and display geometry.
 
-- From another app, toggle the main Seance window using a configured global
-  hotkey. Verify that an active window hides and a hidden/background window
-  appears and receives focus.
-- Configure two dedicated workspace windows with different hotkeys. Check
-  their independent visibility, scoped session lists, recreation after closing,
-  and that removing a window definition preserves its terminal sessions.
-- While recording a shortcut in Settings, press a registered global hotkey.
-  Check conflict feedback and confirm the target window does not hide.
-- Edit terminal color hex values, inspect the preview, test invalid input,
-  and verify Apply, Reset, and persistence after reopening the app.
-- Import installed iTerm2 profiles and an `.itermcolors` file through the
-  Colors tab. Choose a palette, apply it, and inspect text, ANSI colors,
-  selection, and cursor rendering.
+## Remaining physical-keyboard checks
 
-Restore temporary test hotkeys, window definitions, and colors after testing.
+App-targeted automation did not trigger macOS global hotkeys. These need a
+physical keyboard check; they are not represented as completed UI tests:
+
+- Summon and dismiss Main and two named Seances from another app, including a
+  fullscreen Space, without changing the visible Space or raising the other
+  Seance windows. Check focus return and hiding when leaving the app.
+- Repeat across displays with different scaling, and after closing a window
+  so the hotkey must recreate it.
+- Press an already registered global chord during Settings capture and verify
+  conflict feedback without toggling a window.
+
+GitHub issues are disabled on the fork; this file records the follow-up.
+Temporary test collections and bindings were removed. The existing Main
+shortcut was preserved, with its new Overlay option enabled for review.

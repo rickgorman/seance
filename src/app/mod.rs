@@ -45,6 +45,7 @@ mod sidebar;
 mod tiles;
 mod util;
 pub(crate) mod window_hotkeys;
+mod window_overlay;
 mod workspaces;
 
 use self::actions::*;
@@ -266,10 +267,14 @@ pub struct SeanceApp {
     workspace_unread: std::collections::HashMap<String, WorkspaceAttention>,
     /// Full-window live overview (ctrl+shift+space).
     overview: bool,
-    /// Which circles this OS window shows (main / blank / one workspace).
+    /// Which OS window this is (main / blank / a named Seance).
     window_scope: window_hotkeys::WindowScope,
-    /// Dedicated window: bound slug still exists in the daemon catalog.
-    scoped_target_available: bool,
+    /// Circles this window shows, derived from desktop prefs (never from the
+    /// connection's subscriptions). Refreshed by `apply_scope_change`.
+    projection: preferences::Projection,
+    /// Every circle the daemon knows, before projection — new-circle name
+    /// collisions and rail bookkeeping look here, not at this window's rows.
+    global_workspaces: std::collections::BTreeSet<String>,
     /// This window's GPUI handle (for per-window close / visibility).
     own_window: gpui::AnyWindowHandle,
     /// Quicklaunch strip entries (~/.config/seance/quicklaunch.json).
@@ -419,11 +424,11 @@ impl SeanceApp {
         Self::new_inner(window, cx, window_hotkeys::WindowScope::Blank)
     }
 
-    pub fn new_workspace_window(window: &mut Window, cx: &mut Context<Self>, slug: &str) -> Self {
+    pub fn new_seance_window(window: &mut Window, cx: &mut Context<Self>, id: &str) -> Self {
         Self::new_inner(
             window,
             cx,
-            window_hotkeys::WindowScope::Workspace(slug.to_string()),
+            window_hotkeys::WindowScope::Seance(id.to_string()),
         )
     }
 
@@ -439,7 +444,9 @@ impl SeanceApp {
         } else {
             crate::subscriptions_pref::load()
         };
-        let (client, event_rx) = if empty || scope.fixed_workspace().is_some() {
+        // A Seance window subscribes only to its own circles (see
+        // `reconcile_subscriptions`), so it starts from nothing.
+        let (client, event_rx) = if empty || scope.seance_id().is_some() {
             GuiClient::connect_empty().expect("gui client connect empty")
         } else {
             GuiClient::connect().expect("gui client connect to daemon")
@@ -447,13 +454,13 @@ impl SeanceApp {
         // `connect()` decides blank-window on its own (second process /
         // SEANCE_EMPTY_WINDOW); such a window must never persist a list.
         let empty = empty || client.is_empty_window();
-        let scope = if empty && !scope.fixed_workspace().is_some() {
+        let scope = if empty && scope.seance_id().is_none() {
             window_hotkeys::WindowScope::Blank
         } else {
             scope
         };
-        let scoped_target_available = scope.fixed_workspace().is_none();
-        let subs_seeded = pref.is_some() && !empty;
+        let projection = scope.projection(&preferences::desktop_prefs().read().unwrap());
+        let subs_seeded = pref.is_some() && !scope.is_blank();
         let remote_cache = Arc::new(crate::remote_cache::RemoteCache::new(Arc::clone(&client)));
 
         let mut app = SeanceApp {
@@ -508,7 +515,8 @@ impl SeanceApp {
             workspace_unread: std::collections::HashMap::new(),
             overview: false,
             window_scope: scope,
-            scoped_target_available,
+            projection,
+            global_workspaces: std::collections::BTreeSet::new(),
             own_window: window.window_handle(),
             quicklaunch: Vec::new(),
             quicklaunch_mtime: None,
@@ -767,24 +775,15 @@ impl SeanceApp {
         })
         .detach();
 
-        match &app.window_scope {
-            window_hotkeys::WindowScope::Main => {
-                window_hotkeys::WindowHotkeys::register_main(cx, app.own_window);
-            }
-            window_hotkeys::WindowScope::Workspace(slug) => {
-                window_hotkeys::WindowHotkeys::register_workspace(cx, slug.clone(), app.own_window);
-            }
-            window_hotkeys::WindowScope::Blank => {}
+        if let Some(slot) = app.window_scope.slot() {
+            let weak = cx.weak_entity();
+            window_hotkeys::WindowHotkeys::register_window(cx, slot, app.own_window, weak);
         }
         app
     }
 
-    fn fixed_scope(&self) -> Option<&str> {
-        self.window_scope.fixed_workspace()
-    }
-
     fn workspace_in_scope(&self, workspace: &str) -> bool {
-        workspaces::workspace_in_window_scope(self.fixed_scope(), workspace)
+        self.projection.admits(workspace)
     }
 
     fn slug_in_scope(&self, slug: &str) -> bool {
@@ -793,7 +792,122 @@ impl SeanceApp {
             .iter()
             .find(|p| p.slug == slug)
             .map(|p| p.workspace.as_str());
-        workspaces::slug_in_window_scope(self.fixed_scope(), ws)
+        workspaces::slug_in_window_scope(&self.projection, ws)
+    }
+
+    /// Seance membership changed (this window's or another's): re-derive the
+    /// projection, drop what left right now, and ask the daemon for a fresh
+    /// `State` so what entered hydrates. Sessions are never touched.
+    pub(super) fn apply_scope_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let prefs = preferences::desktop_prefs().read().unwrap().clone();
+        let proj = self.window_scope.projection(&prefs);
+        if proj == self.projection {
+            return;
+        }
+        self.projection = proj;
+        let departed: std::collections::HashSet<String> = self
+            .panes
+            .iter()
+            .filter(|p| !self.projection.admits(&p.workspace))
+            .map(|p| p.slug.clone())
+            .collect();
+        for slug in &departed {
+            self.pop_in(slug, cx);
+        }
+        let gone = |slug: &String| departed.contains(slug);
+        self.panes.retain(|p| !gone(&p.slug));
+        self.busy_panes.retain(|s| !gone(s));
+        self.statuses.retain(|s, _| !gone(s));
+        self.owners.retain(|s, _| !gone(s));
+        self.workspace_focus
+            .retain(|ws, s| !gone(s) && self.projection.admits(ws));
+        let proj = self.projection.clone();
+        self.extra_workspaces.retain(|w| proj.admits(w));
+        self.workspace_order.retain(|w| proj.admits(w));
+        self.pr_links.retain(|w, _| proj.admits(w));
+        self.workspace_unread.retain(|w, _| proj.admits(w));
+        self.asks
+            .retain(|a| a.workspace.as_deref().is_none_or(|w| proj.admits(w)));
+        for slot in [
+            &mut self.active_slug,
+            &mut self.zoomed_slug,
+            &mut self.pending_focus,
+        ] {
+            if slot.as_ref().is_some_and(gone) {
+                *slot = None;
+            }
+        }
+        if self.flipped.as_ref().is_some_and(|(s, _)| gone(s)) {
+            self.flipped = None;
+        }
+        if self.whisper.as_ref().is_some_and(|(s, _)| gone(s)) {
+            self.whisper = None;
+        }
+        if matches!(&self.drawer, Drawer::Pad { slug } if gone(slug)) {
+            self.drawer = Drawer::Closed;
+        }
+        if self
+            .selected_workspace
+            .as_deref()
+            .is_some_and(|w| !proj.admits(w))
+        {
+            self.selected_workspace = None;
+            self.select_first_projected_workspace();
+        }
+        // Rehydrate: a Seance subscribes to members it isn't streaming yet;
+        // any Subscribe (even a repeat) answers with a full State, so poke
+        // one known projected circle when nothing new needed asking for.
+        let subs = self.subscriptions.clone();
+        let global = self.global_workspaces.clone();
+        let missing =
+            workspaces::subscriptions_to_request(&self.window_scope, &proj, &global, &subs);
+        if missing.is_empty() {
+            if let Some(ws) = global.iter().find(|w| proj.admits(w)) {
+                let _ = self.client.subscribe(ws);
+            }
+        } else {
+            for ws in missing {
+                let _ = self.client.subscribe(&ws);
+            }
+        }
+        self.ensure_active_pane_in_workspace();
+        self.restore_keyboard_focus(window, cx);
+        cx.notify();
+    }
+
+    /// Selection fell outside the projection (or never landed): take the
+    /// first projected circle the daemon actually knows. With none, leave
+    /// the window empty — no invented circle, no stray active pane.
+    fn select_first_projected_workspace(&mut self) {
+        let first = self
+            .workspaces()
+            .into_iter()
+            .find(|w| self.global_workspaces.contains(w));
+        match first {
+            Some(ws) => {
+                self.selected_workspace = Some(ws.clone());
+                let _ = self.client.set_focus(None, Some(ws));
+            }
+            None => {
+                self.selected_workspace = None;
+                self.active_slug = None;
+                self.zoomed_slug = None;
+                self.pending_focus = None;
+            }
+        }
+    }
+
+    /// Sidebar / empty-state heading: the Seance's name, else "seance".
+    fn window_heading(&self) -> String {
+        match self.window_scope.seance_id() {
+            Some(id) => preferences::desktop_prefs()
+                .read()
+                .unwrap()
+                .seance(id)
+                .map(|d| d.name.clone())
+                .unwrap_or_else(|| "seance".into()),
+            None => "seance".into(),
+        }
     }
 
     fn emits_global_notifications(&self, cx: &mut Context<Self>) -> bool {
@@ -837,7 +951,6 @@ impl SeanceApp {
                 self.windows = windows;
                 self.subscriptions = subscriptions;
 
-                let fixed_slug = self.window_scope.fixed_workspace().map(str::to_string);
                 let global_known = workspaces::workspace_catalog_from_state(
                     panes.iter().map(|p| p.workspace.as_str()),
                     &extra_workspaces,
@@ -845,58 +958,43 @@ impl SeanceApp {
                     workspace_meta.iter().map(|m| m.workspace.as_str()),
                     selected_workspace.as_deref(),
                 );
+                self.global_workspaces = global_known.clone();
+                // Labels first: fold pruning in `reconcile_subscriptions`
+                // groups by display name, and a fresh window has none yet.
+                // Labels arrive for every known circle, so rebuild wholesale:
+                // a circle renamed back to its slug must lose its entry.
+                self.workspace_names = workspaces::labels_from_meta(&workspace_meta);
                 self.reconcile_subscriptions(&global_known);
 
-                let panes: Vec<PaneInfo> = if let Some(ws) = fixed_slug.as_deref() {
-                    panes.into_iter().filter(|p| p.workspace == ws).collect()
-                } else {
-                    panes
-                };
-                let extra_workspaces = if let Some(ws) = fixed_slug.as_deref() {
-                    extra_workspaces.into_iter().filter(|w| w == ws).collect()
-                } else {
-                    extra_workspaces
-                };
-                let workspace_order = if let Some(ws) = fixed_slug.as_deref() {
-                    workspace_order.into_iter().filter(|w| w == ws).collect()
-                } else {
-                    workspace_order
-                };
-                let workspace_meta = if let Some(ws) = fixed_slug.as_deref() {
-                    workspace_meta
-                        .into_iter()
-                        .filter(|m| m.workspace == ws)
-                        .collect()
-                } else {
-                    workspace_meta
-                };
-                let asks = if let Some(ws) = fixed_slug.as_deref() {
-                    asks.into_iter()
-                        .filter(|a| a.workspace.as_deref() == Some(ws))
-                        .collect()
-                } else {
-                    asks
-                };
-                let selected_workspace = if let Some(ws) = fixed_slug.as_deref() {
-                    Some(ws.to_string())
-                } else {
-                    selected_workspace
-                };
-
-                let focused_pane = if fixed_slug.is_some() && !self.scoped_target_available {
-                    None
-                } else if fixed_slug.is_some() {
-                    focused_pane.filter(|slug| panes.iter().any(|p| p.slug == *slug))
-                } else {
-                    focused_pane
-                };
-
-                let (panes, extra_workspaces, workspace_order, workspace_meta) =
-                    if fixed_slug.is_some() && !self.scoped_target_available {
-                        (Vec::new(), Vec::new(), Vec::new(), Vec::new())
-                    } else {
-                        (panes, extra_workspaces, workspace_order, workspace_meta)
-                    };
+                // Project: this window keeps only its own circles. Streams the
+                // connection still carries for other circles stop here.
+                let proj = self.projection.clone();
+                let panes: Vec<PaneInfo> = panes
+                    .into_iter()
+                    .filter(|p| proj.admits(&p.workspace))
+                    .collect();
+                let extra_workspaces: Vec<String> = extra_workspaces
+                    .into_iter()
+                    .filter(|w| proj.admits(w))
+                    .collect();
+                let workspace_order: Vec<String> = workspace_order
+                    .into_iter()
+                    .filter(|w| proj.admits(w))
+                    .collect();
+                // Meta stays global: labels, and the activity/touch census
+                // that new-circle names are uniquified against, cover every
+                // circle. Only what's drawn (PR links below) is projected.
+                let asks: Vec<_> = asks
+                    .into_iter()
+                    .filter(|a| a.workspace.as_deref().is_none_or(|w| proj.admits(w)))
+                    .collect();
+                // The daemon's pick for this connection may be a circle this
+                // window doesn't show (fresh Seance, just-moved circle); fall
+                // back to the first projected circle, never invent one.
+                let selected_workspace =
+                    selected_workspace.filter(|w| proj.admits(w) && global_known.contains(w));
+                let focused_pane =
+                    focused_pane.filter(|slug| panes.iter().any(|p| p.slug == *slug));
 
                 // Re-seed busy from the daemon's verdict — a full state push is
                 // the resync point for panes whose flips we may have missed
@@ -907,6 +1005,7 @@ impl SeanceApp {
                     .map(|p| p.slug.clone())
                     .collect();
 
+                let fell_back = selected_workspace.is_none();
                 self.selected_workspace = selected_workspace;
                 self.active_slug = focused_pane;
                 self.extra_workspaces = extra_workspaces;
@@ -975,14 +1074,8 @@ impl SeanceApp {
                 // pr_links arrive for every known workspace: rebuild the
                 // mirror wholesale so cleared/renamed circles drop out.
                 let mut links = std::collections::HashMap::new();
-                // Labels arrive for every known circle, so rebuild wholesale:
-                // a circle renamed back to its slug must lose its entry.
-                let mut names = std::collections::HashMap::new();
                 for m in workspace_meta {
-                    if let Some(n) = m.name.clone() {
-                        names.insert(m.workspace.clone(), n);
-                    }
-                    if !m.pr_links.is_empty() {
+                    if !m.pr_links.is_empty() && proj.admits(&m.workspace) {
                         links.insert(m.workspace.clone(), m.pr_links.clone());
                     }
                     if m.last_output_ms > 0 {
@@ -1004,10 +1097,12 @@ impl SeanceApp {
                     }
                 }
                 self.pr_links = links;
-                self.workspace_names = names;
                 // active_slug from daemon; repair if missing / not in selected
                 // workspace. Keyboard recovery is render-side (ensure_keyboard_focus)
                 // so we don't steal focus from whisper / rename / palette here.
+                if fell_back {
+                    self.select_first_projected_workspace();
+                }
                 self.ensure_active_pane_in_workspace();
                 self.sync_workspace_working_touches();
                 cx.notify();
@@ -1319,10 +1414,10 @@ impl SeanceApp {
                 eprintln!("[seance gui] closed remotely by {by}");
                 self.client.disconnect();
                 let handle = self.own_window;
-                let scope = self.window_scope.clone();
+                let slot = self.window_scope.slot();
                 cx.defer(move |cx| {
-                    if matches!(scope, window_hotkeys::WindowScope::Main) {
-                        window_hotkeys::WindowHotkeys::clear_main(cx);
+                    if let Some(slot) = slot {
+                        window_hotkeys::WindowHotkeys::unregister_window(cx, &slot, handle);
                     }
                     let _ = handle.update(cx, |_, window, _| window.remove_window());
                 });
@@ -1387,7 +1482,9 @@ impl SeanceApp {
     /// stay correct without the old 90%+ CPU tax from spinning TUIs.
     fn apply_grid_snap(&mut self, snap: GridSnapshot, cx: &mut Context<Self>) {
         let slug = snap.pane.clone();
-        if self.fixed_scope().is_some() && !self.panes.iter().any(|p| p.slug == slug) {
+        // Streams for circles outside this window's projection may still
+        // arrive (no unsubscribe); a pane we don't list is never painted.
+        if !self.panes.iter().any(|p| p.slug == slug) {
             return;
         }
         // Time-since-activity stamps ONLY on real content change. Attach /
@@ -1871,13 +1968,23 @@ impl SeanceApp {
 
     fn spawn_internal(&mut self, req: SpawnRequest, cx: &mut Context<Self>) -> Option<String> {
         // All spawns go through the daemon — PTYs never live in the GUI process.
-        let _ = self.client.spawn_pane(
-            &req.name,
-            req.cwd,
-            req.command,
-            req.workspace.or_else(|| self.selected_workspace.clone()),
-            req.file,
-        );
+        let mut workspace = req.workspace.or_else(|| self.selected_workspace.clone());
+        if !matches!(self.projection, preferences::Projection::All) {
+            // An empty Seance (or a main window whose tabs all moved out) has
+            // no circle to land in: make one here rather than letting the
+            // daemon pick a circle this window can't show.
+            let ws = workspace.unwrap_or_else(|| self.fresh_global_circle_name());
+            if !self.global_workspaces.contains(&ws) {
+                self.claim_new_circle(&ws, cx);
+            }
+            if !self.projection.admits(&ws) {
+                return None;
+            }
+            workspace = Some(ws);
+        }
+        let _ = self
+            .client
+            .spawn_pane(&req.name, req.cwd, req.command, workspace, req.file);
         self.session_counter += 1;
         cx.notify();
         // Real slug arrives via GuiEvent::PaneSpawned / State.
@@ -2804,11 +2911,8 @@ impl Render for SeanceApp {
                 this.move_to_workspace(&act.slug.clone(), &act.workspace.clone(), cx);
             }))
             .on_action(cx.listener(|this, act: &ActMoveToNewWorkspace, _, cx| {
-                if this.window_scope.fixed_workspace().is_some() {
-                    return;
-                }
-                let n = this.known_workspace_names().len() + 1;
-                this.move_to_workspace(&act.0.clone(), &format!("circle-{n}"), cx);
+                let name = this.fresh_global_circle_name();
+                this.move_to_workspace(&act.0.clone(), &name, cx);
             }))
             .on_action(cx.listener(|this, act: &ActTogglePopout, _, cx| {
                 this.toggle_popout(&act.0.clone(), cx);

@@ -12,6 +12,7 @@ use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::Root;
 
 use super::colors::{self, ColorScheme, ImportResult};
+use super::preferences::WindowSlot;
 use super::preferences::{
     self, adjust_font_size, apply_color_scheme_from_settings, apply_font_from_settings,
     chords_for_action, clamp_font_size, desktop_prefs, reset_action, reset_all_shortcuts,
@@ -36,9 +37,20 @@ pub fn clear_settings_window() {
     }
 }
 
+pub fn settings_window_handle() -> Option<AnyWindowHandle> {
+    SETTINGS_WINDOW.lock().ok().and_then(|g| g.clone())
+}
+
 pub fn focus_existing_settings(cx: &mut App) -> bool {
-    let handle = SETTINGS_WINDOW.lock().ok().and_then(|g| g.clone());
+    let handle = settings_window_handle();
     if let Some(handle) = handle {
+        if window_hotkeys::settings_opens_as_companion() {
+            // The companion raise orders Settings front + key, then activates.
+            // Deferred: from inside Settings' own event its handle is taken.
+            cx.defer(|cx| WindowHotkeys::sync_settings_layer(cx, true));
+            return true;
+        }
+        WindowHotkeys::sync_settings_layer(cx, false);
         return cx
             .update_window(handle, |_, window, _| window.activate_window())
             .is_ok();
@@ -93,7 +105,14 @@ pub struct SettingsWindow {
     row_error: Option<String>,
     polled_save_err: Option<String>,
     installed: HashSet<String>,
-    pick_workspace: String,
+    /// Name field for "Create Seance" — built once in `new`, never in render.
+    new_seance_name: gpui::Entity<InputState>,
+    /// Shared rename field, loaded with the row's name when Rename is clicked.
+    rename_input: gpui::Entity<InputState>,
+    /// Seance id whose name is being edited.
+    renaming: Option<String>,
+    /// Seance id whose tab picker is expanded.
+    members_open: Option<String>,
     color_fields: Vec<(SharedString, gpui::Entity<InputState>)>,
     color_apply_error: Option<String>,
     color_import_busy: bool,
@@ -114,6 +133,21 @@ impl SettingsWindow {
             .cloned()
             .collect::<Vec<_>>();
         monospace_fonts.sort();
+        let new_seance_name = cx
+            .new(|cx| InputState::new(window, cx).placeholder("New Seance name, e.g. Client work"));
+        let rename_input = cx.new(|cx| InputState::new(window, cx));
+        cx.subscribe_in(&new_seance_name, window, |this, _, event, window, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                this.create_seance_from_field(window, cx);
+            }
+        })
+        .detach();
+        cx.subscribe(&rename_input, |this, _, event, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                this.commit_rename(cx);
+            }
+        })
+        .detach();
         let polled_save_err = save_error();
         let entity = cx.weak_entity();
         cx.spawn(async move |_, cx| loop {
@@ -145,7 +179,10 @@ impl SettingsWindow {
             row_error: None,
             polled_save_err,
             installed,
-            pick_workspace: String::new(),
+            new_seance_name,
+            rename_input,
+            renaming: None,
+            members_open: None,
             color_fields,
             color_apply_error: None,
             color_import_busy: false,
@@ -220,11 +257,8 @@ impl SettingsWindow {
         }
         let is_app_capture = matches!(capture, SettingsCapture::AppShortcut(_));
         let result = match capture {
-            SettingsCapture::MainWindow => {
-                window_hotkeys::WindowHotkeys::bind_main(cx, chord.clone())
-            }
-            SettingsCapture::WorkspaceRow(i) => {
-                window_hotkeys::WindowHotkeys::bind_workspace(cx, i, chord.clone())
+            SettingsCapture::Window(slot) => {
+                window_hotkeys::WindowHotkeys::bind_slot(cx, &slot, chord.clone())
             }
             SettingsCapture::AppShortcut(action) => {
                 if let Some(c) = chord {
@@ -637,7 +671,7 @@ impl SettingsWindow {
             div()
                 .text_sm()
                 .text_color(SeancePalette::text_dim())
-                .child("Terminal colors for panes, popouts, and overview thumbs. App chrome stays candlelit until you Apply.")
+                .child("Terminal colors for panes, popouts, and overview thumbnails. Changes take effect when you Apply.")
                 .into_any_element(),
         );
         if self.color_import_busy {
@@ -1001,168 +1035,412 @@ impl SettingsWindow {
         rows
     }
 
+    fn create_seance_from_field(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let name = self.new_seance_name.read(cx).value().to_string();
+        match WindowHotkeys::create_seance(cx, &name) {
+            Ok(id) => {
+                self.row_error = None;
+                self.members_open = Some(id);
+                self.new_seance_name
+                    .update(cx, |s, cx| s.set_value("", window, cx));
+            }
+            Err(e) => self.row_error = Some(e),
+        }
+        cx.notify();
+    }
+
+    fn start_rename(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let name = desktop_prefs()
+            .read()
+            .unwrap()
+            .seance(id)
+            .map(|d| d.name.clone())
+            .unwrap_or_default();
+        self.rename_input
+            .update(cx, |s, cx| s.set_value(name, window, cx));
+        self.renaming = Some(id.to_string());
+        self.row_error = None;
+        cx.notify();
+    }
+
+    fn commit_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.renaming.clone() else {
+            return;
+        };
+        let name = self.rename_input.read(cx).value().to_string();
+        match WindowHotkeys::rename_seance(cx, &id, &name) {
+            Ok(()) => {
+                self.renaming = None;
+                self.row_error = None;
+            }
+            Err(e) => self.row_error = Some(e),
+        }
+        cx.notify();
+    }
+
+    fn remove_seance(&mut self, id: &str, cx: &mut Context<Self>) {
+        if self.windows_capture == Some(SettingsCapture::Window(WindowSlot::Seance(id.to_string())))
+        {
+            self.clear_capture(cx);
+        }
+        match WindowHotkeys::remove_seance(cx, id) {
+            Ok(()) => {
+                if self.renaming.as_deref() == Some(id) {
+                    self.renaming = None;
+                }
+                if self.members_open.as_deref() == Some(id) {
+                    self.members_open = None;
+                }
+                self.row_error = None;
+            }
+            Err(e) => self.row_error = Some(e.message()),
+        }
+        cx.notify();
+    }
+
     fn render_windows_page(&mut self, mac: bool, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
         let supported = window_hotkeys::WindowHotkeys::platform_supported();
+        let overlay_ok = window_hotkeys::WindowHotkeys::overlay_supported();
         let prefs = desktop_prefs().read().unwrap().clone();
         let catalog = WindowHotkeys::catalog(cx);
         let mut rows = Vec::new();
         if !supported {
             rows.push(
-                div()
-                    .text_sm()
-                    .text_color(SeancePalette::text_dim())
-                    .child("Global window hotkeys are only supported on macOS. Definitions are saved but not registered on this platform.")
+                note("Global window hotkeys are only supported on macOS. Definitions are saved but not registered on this platform.")
                     .into_any_element(),
             );
         }
+        rows.push(
+            note("Each Seance is its own window with its own tabs, sidebar and hotkey. A tab lives in exactly one place: the main window holds every tab no Seance has claimed.")
+                .into_any_element(),
+        );
+
+        // Main window.
+        let main_slot = WindowSlot::Main;
         let main_label = prefs
             .main_window_hotkey
             .as_ref()
             .map(|c| c.display(mac))
             .unwrap_or_else(|| "Unassigned".into());
-        let main_cap = self.windows_capture == Some(SettingsCapture::MainWindow);
-        rows.push(
-            div()
-                .text_sm()
-                .text_color(SeancePalette::text_dim())
-                .child("System-wide show/hide for the primary Seance window.")
-                .into_any_element(),
-        );
-        rows.push(window_row(
-            "Main window",
-            &main_label,
-            main_cap,
-            cx,
-            |this, window, cx| {
-                this.start_windows_capture(SettingsCapture::MainWindow, window, cx);
-            },
-            |this, cx| {
-                let _ = WindowHotkeys::bind_main(cx, None);
-                this.row_error = None;
-                cx.notify();
-            },
-            |_this, cx| {
-                WindowHotkeys::open_or_toggle_main(cx);
-                cx.notify();
-            },
-        ));
+        let main_cap = self.windows_capture == Some(SettingsCapture::Window(main_slot.clone()));
+        let unassigned = catalog
+            .iter()
+            .filter(|(slug, _)| prefs.owner_of(slug).is_none())
+            .count();
+        rows.push(section_card(vec![
+            window_row(
+                "main",
+                &format!("Main window — unassigned tabs ({unassigned})"),
+                &main_label,
+                main_cap,
+                cx,
+                |this, window, cx| {
+                    this.start_windows_capture(
+                        SettingsCapture::Window(WindowSlot::Main),
+                        window,
+                        cx,
+                    );
+                },
+                |this, cx| {
+                    if let Err(e) = WindowHotkeys::bind_slot(cx, &WindowSlot::Main, None) {
+                        this.row_error = Some(e.message());
+                    } else {
+                        this.row_error = None;
+                    }
+                    cx.notify();
+                },
+                |_this, cx| {
+                    WindowHotkeys::open_or_toggle_main(cx);
+                    cx.notify();
+                },
+            ),
+            overlay_toggle(
+                "main",
+                prefs.main_window_overlay,
+                overlay_ok,
+                cx,
+                |_, cx| {
+                    let on = !desktop_prefs().read().unwrap().main_window_overlay;
+                    WindowHotkeys::set_overlay(cx, &WindowSlot::Main, on);
+                    cx.notify();
+                },
+            ),
+        ]));
+
+        // Create.
         rows.push(
             div()
                 .pt_2()
-                .text_sm()
-                .text_color(SeancePalette::text_dim())
-                .child("Dedicated workspace windows — each stays on one circle.")
-                .into_any_element(),
-        );
-        let pick = if self.pick_workspace.is_empty() {
-            catalog.first().map(|(s, _)| s.clone()).unwrap_or_default()
-        } else {
-            self.pick_workspace.clone()
-        };
-        rows.push(
-            div()
                 .flex()
-                .flex_col()
-                .gap_1()
-                .child(div().text_sm().child("Circle for new window:"))
-                .children(catalog.iter().map(|(slug, label)| {
-                    let active = pick == *slug;
-                    let pick_slug = slug.clone();
-                    div()
-                        .id(SharedString::from(format!("ws-pick-{slug}")))
-                        .px_2()
-                        .py_1()
-                        .rounded_md()
-                        .cursor_pointer()
-                        .bg(if active {
-                            SeancePalette::surface()
-                        } else {
-                            SeancePalette::bg_elevated()
-                        })
-                        .text_sm()
-                        .text_color(if active {
-                            SeancePalette::flame()
-                        } else {
-                            SeancePalette::text()
-                        })
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.pick_workspace = pick_slug.clone();
-                            this.row_error = None;
-                            cx.notify();
-                        }))
-                        .child(if active {
-                            format!("✓ {label}")
-                        } else {
-                            label.clone()
-                        })
-                        .into_any_element()
-                }))
-                .child(action_button("Add window", cx, |this, cx| {
-                    let pick = if this.pick_workspace.is_empty() {
-                        WindowHotkeys::catalog(cx)
-                            .first()
-                            .map(|(s, _)| s.clone())
-                            .unwrap_or_default()
-                    } else {
-                        this.pick_workspace.clone()
-                    };
-                    if pick.is_empty() {
-                        this.row_error = Some("Choose a workspace first.".into());
-                    } else if let Err(e) = WindowHotkeys::add_workspace_definition(cx, pick.clone())
-                    {
-                        this.row_error = Some(e);
-                    } else {
-                        this.row_error = None;
-                        window_hotkeys::open_workspace_window(cx, pick.clone());
-                    }
-                    cx.notify();
-                }))
+                .items_center()
+                .gap_2()
+                .child(div().flex_1().child(Input::new(&self.new_seance_name)))
+                .child(shortcut_button(
+                    "create-seance",
+                    "Create Seance",
+                    cx,
+                    |this, window, cx| {
+                        this.create_seance_from_field(window, cx);
+                    },
+                ))
                 .into_any_element(),
         );
-        for (i, def) in prefs.workspace_windows.iter().enumerate() {
-            let label = catalog
-                .iter()
-                .find(|(s, _)| s == &def.workspace)
-                .map(|(_, l)| l.as_str())
-                .unwrap_or(def.workspace.as_str());
-            let chord = def
-                .shortcut
-                .as_ref()
-                .map(|c| c.display(mac))
-                .unwrap_or_else(|| "Unassigned".into());
-            let cap = self.windows_capture == Some(SettingsCapture::WorkspaceRow(i));
-            let idx = i;
-            rows.push(window_row(
-                label,
-                &chord,
-                cap,
-                cx,
-                move |this, window, cx| {
-                    this.start_windows_capture(SettingsCapture::WorkspaceRow(idx), window, cx);
-                },
-                move |this, cx| {
-                    let _ = WindowHotkeys::bind_workspace(cx, idx, None);
-                    this.row_error = None;
-                    cx.notify();
-                },
-                move |_this, cx| {
-                    WindowHotkeys::open_or_toggle_workspace(cx, idx);
-                    cx.notify();
-                },
-            ));
+        if prefs.seance_defs().is_empty() {
             rows.push(
-                div()
-                    .pb_2()
-                    .child(action_button("Remove window", cx, move |this, cx| {
-                        this.clear_capture(cx);
-                        WindowHotkeys::remove_workspace_definition(cx, idx);
-                        this.row_error = None;
-                        cx.notify();
-                    }))
+                note("No named Seances yet. Create one, tick the tabs it should hold, then Open it or bind a hotkey.")
                     .into_any_element(),
             );
         }
+
+        for def in prefs.seance_defs() {
+            rows.push(self.render_seance_card(def, &prefs, &catalog, mac, overlay_ok, cx));
+        }
         rows
+    }
+
+    fn render_seance_card(
+        &mut self,
+        def: &preferences::SeanceDef,
+        prefs: &preferences::DesktopPrefs,
+        catalog: &[(String, String)],
+        mac: bool,
+        overlay_ok: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let id = def.id.clone();
+        let slot = WindowSlot::Seance(id.clone());
+        let mut parts = Vec::new();
+
+        // Name line: label or rename field.
+        let renaming = self.renaming.as_deref() == Some(id.as_str());
+        let name_line = if renaming {
+            let cancel_id = id.clone();
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(div().flex_1().child(Input::new(&self.rename_input)))
+                .child(shortcut_button(
+                    &format!("rename-save-{id}"),
+                    "Save",
+                    cx,
+                    |this, _, cx| {
+                        this.commit_rename(cx);
+                    },
+                ))
+                .child(shortcut_button(
+                    &format!("rename-cancel-{id}"),
+                    "Cancel",
+                    cx,
+                    move |this, _, cx| {
+                        if this.renaming.as_deref() == Some(cancel_id.as_str()) {
+                            this.renaming = None;
+                        }
+                        this.row_error = None;
+                        cx.notify();
+                    },
+                ))
+                .into_any_element()
+        } else {
+            let rename_id = id.clone();
+            let remove_id = id.clone();
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .flex_1()
+                        .text_color(SeancePalette::flame())
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .child(def.name.clone()),
+                )
+                .child(shortcut_button(
+                    &format!("rename-{id}"),
+                    "Rename",
+                    cx,
+                    move |this, window, cx| this.start_rename(&rename_id, window, cx),
+                ))
+                .child(shortcut_button(
+                    &format!("remove-{id}"),
+                    "Remove",
+                    cx,
+                    move |this, _, cx| this.remove_seance(&remove_id, cx),
+                ))
+                .into_any_element()
+        };
+        parts.push(name_line);
+
+        let chord = def
+            .shortcut
+            .as_ref()
+            .map(|c| c.display(mac))
+            .unwrap_or_else(|| "Unassigned".into());
+        let cap = self.windows_capture == Some(SettingsCapture::Window(slot.clone()));
+        let (bind_slot, clear_slot, open_id) = (slot.clone(), slot.clone(), id.clone());
+        parts.push(window_row(
+            &id,
+            &format!(
+                "{} tab{}",
+                def.members.len(),
+                if def.members.len() == 1 { "" } else { "s" }
+            ),
+            &chord,
+            cap,
+            cx,
+            move |this, window, cx| {
+                this.start_windows_capture(SettingsCapture::Window(bind_slot.clone()), window, cx);
+            },
+            move |this, cx| {
+                if let Err(e) = WindowHotkeys::bind_slot(cx, &clear_slot, None) {
+                    this.row_error = Some(e.message());
+                } else {
+                    this.row_error = None;
+                }
+                cx.notify();
+            },
+            move |_this, cx| {
+                WindowHotkeys::open_seance(cx, &open_id);
+                cx.notify();
+            },
+        ));
+        let overlay_slot = slot.clone();
+        parts.push(overlay_toggle(
+            &id,
+            def.overlay,
+            overlay_ok,
+            cx,
+            move |_, cx| {
+                let on = !desktop_prefs().read().unwrap().overlay_for(&overlay_slot);
+                WindowHotkeys::set_overlay(cx, &overlay_slot, on);
+                cx.notify();
+            },
+        ));
+
+        // Tabs.
+        let open = self.members_open.as_deref() == Some(id.as_str());
+        let label_of = |slug: &str| {
+            catalog
+                .iter()
+                .find(|(s, _)| s == slug)
+                .map(|(_, l)| l.clone())
+                .unwrap_or_else(|| slug.to_string())
+        };
+        let summary = if def.members.is_empty() {
+            "No tabs yet".to_string()
+        } else {
+            def.members
+                .iter()
+                .map(|m| label_of(m))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let toggle_id = id.clone();
+        parts.push(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .flex_1()
+                        .text_xs()
+                        .text_color(SeancePalette::text_dim())
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .child(summary),
+                )
+                .child(shortcut_button(
+                    &format!("tabs-{id}"),
+                    if open { "Done" } else { "Choose tabs…" },
+                    cx,
+                    move |this, _, cx| {
+                        this.members_open =
+                            if this.members_open.as_deref() == Some(toggle_id.as_str()) {
+                                None
+                            } else {
+                                Some(toggle_id.clone())
+                            };
+                        cx.notify();
+                    },
+                ))
+                .into_any_element(),
+        );
+        if open {
+            parts.push(
+                note("Ticking a tab MOVES it here (out of Main or another Seance). Unticking returns it to Main.")
+                    .into_any_element(),
+            );
+            // Catalog circles, then members the daemon doesn't list (so they
+            // can still be unticked).
+            let mut entries: Vec<(String, String)> = catalog.to_vec();
+            for m in &def.members {
+                if !catalog.iter().any(|(s, _)| s == m) {
+                    entries.push((m.clone(), format!("{m} (not running)")));
+                }
+            }
+            let mut list = div()
+                .id(SharedString::from(format!("seance-tabs-{id}")))
+                .max_h(px(220.))
+                .overflow_y_scroll()
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .pl_2();
+            for (slug, label) in entries {
+                let mine = def.members.iter().any(|m| *m == slug);
+                let owner = match prefs.owner_of(&slug) {
+                    Some(o) if o.id == id => String::new(),
+                    Some(o) => format!("in {}", o.name),
+                    None => "in Main".into(),
+                };
+                let (ws, target) = (slug.clone(), id.clone());
+                list = list.child(
+                    div()
+                        .id(SharedString::from(format!("seance-tab-{id}-{slug}")))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_1()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(SeancePalette::surface()))
+                        .text_sm()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let into = (!mine).then_some(target.as_str());
+                            WindowHotkeys::assign_circle(cx, &ws, into);
+                            this.row_error = None;
+                            cx.notify();
+                        }))
+                        .child(if mine { "☑" } else { "☐" })
+                        .child(
+                            div()
+                                .flex_1()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .text_color(if mine {
+                                    SeancePalette::text()
+                                } else {
+                                    SeancePalette::text_dim()
+                                })
+                                .child(label),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(SeancePalette::text_faint())
+                                .child(owner),
+                        ),
+                );
+            }
+            parts.push(list.into_any_element());
+        }
+        parts.push(
+            note("Remove closes this window only — its tabs return to Main and every session keeps running.")
+                .into_any_element(),
+        );
+        section_card(parts)
     }
 
     fn start_windows_capture(
@@ -1187,6 +1465,7 @@ impl SettingsWindow {
 }
 
 fn window_row(
+    key: &str,
     label: &str,
     chord: &str,
     capturing: bool,
@@ -1233,24 +1512,81 @@ fn window_row(
                 .flex()
                 .gap_2()
                 .child(shortcut_button(
-                    "bind",
+                    &format!("bind-{key}"),
                     "Bind",
                     cx,
                     move |this, window, cx| {
                         on_bind(this, window, cx);
                     },
                 ))
-                .child(shortcut_button("clear", "Clear", cx, move |this, _, cx| {
-                    on_clear(this, cx);
-                }))
                 .child(shortcut_button(
-                    "toggle",
-                    "Open / hide",
+                    &format!("clear-{key}"),
+                    "Clear",
+                    cx,
+                    move |this, _, cx| {
+                        on_clear(this, cx);
+                    },
+                ))
+                .child(shortcut_button(
+                    &format!("toggle-{key}"),
+                    if key == "main" { "Open / hide" } else { "Open" },
                     cx,
                     move |this, _, cx| {
                         on_toggle(this, cx);
                     },
                 )),
+        )
+        .into_any_element()
+}
+
+fn note(text: &'static str) -> gpui::Div {
+    div()
+        .text_xs()
+        .text_color(SeancePalette::text_dim())
+        .child(text)
+}
+
+fn section_card(children: Vec<gpui::AnyElement>) -> gpui::AnyElement {
+    div()
+        .flex_none()
+        .flex()
+        .flex_col()
+        .gap_1p5()
+        .p_2()
+        .rounded_md()
+        .border_1()
+        .border_color(SeancePalette::border().opacity(0.5))
+        .bg(SeancePalette::bg_elevated())
+        .children(children)
+        .into_any_element()
+}
+
+fn overlay_toggle(
+    key: &str,
+    on: bool,
+    supported: bool,
+    cx: &mut Context<SettingsWindow>,
+    on_click: impl Fn(&mut SettingsWindow, &mut Context<SettingsWindow>) + 'static,
+) -> gpui::AnyElement {
+    div()
+        .id(SharedString::from(format!("settings-overlay-{key}")))
+        .flex()
+        .items_center()
+        .gap_2()
+        .cursor_pointer()
+        .text_sm()
+        .on_click(cx.listener(move |this, _, _, cx| on_click(this, cx)))
+        .child(if on { "☑" } else { "☐" })
+        .child("Overlay")
+        .child(
+            div()
+                .text_xs()
+                .text_color(SeancePalette::text_faint())
+                .child(if supported {
+                    "float over the current Space; hotkey hides back to the previous app"
+                } else {
+                    "macOS only — saved, no effect here"
+                }),
         )
         .into_any_element()
 }
@@ -1319,7 +1655,17 @@ impl SeanceApp {
         if focus_existing_settings(cx) {
             return;
         }
-        let bounds = gpui::Bounds::centered(None, gpui::size(px(720.), px(640.)), cx);
+        // With an Overlay live, Settings starts hidden and unfocused: a
+        // default open orders it onto whatever Space AppKit picks and
+        // activates first. The deferred companion raise below configures
+        // all-Spaces + level, then shows it on the current Space.
+        let companion = window_hotkeys::settings_opens_as_companion();
+        let display_id = if companion {
+            super::window_overlay::pointer_display_id(cx)
+        } else {
+            None
+        };
+        let bounds = gpui::Bounds::centered(display_id, gpui::size(px(720.), px(640.)), cx);
         let win = cx
             .open_window(
                 gpui::WindowOptions {
@@ -1329,6 +1675,14 @@ impl SeanceApp {
                         ..Default::default()
                     }),
                     app_id: Some("seance".into()),
+                    kind: if companion {
+                        gpui::WindowKind::PopUp
+                    } else {
+                        gpui::WindowKind::Normal
+                    },
+                    focus: !companion,
+                    show: !companion,
+                    display_id,
                     ..Default::default()
                 },
                 |window, cx| {
@@ -1351,6 +1705,8 @@ impl SeanceApp {
             )
             .expect("settings window");
         let _ = win;
+        // Configure (and, for a companion, show) once the window exists.
+        cx.defer(|cx| window_hotkeys::WindowHotkeys::sync_settings_layer(cx, true));
     }
 
     pub(crate) fn dispatch_app_action(

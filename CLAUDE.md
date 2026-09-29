@@ -146,7 +146,7 @@ protocol and the same invariant: it has no filesystem at all.
 **Desktop presentation exception:** `~/.config/seance/desktop.json` (or
 `$XDG_CONFIG_HOME/seance/desktop.json`) holds **device-local** GUI prefs only —
 installed terminal font/size, terminal palette, application shortcuts, and
-workspace window definitions with visibility hotkeys. Loaded/saved in the
+named Seances (sets of circle tabs) with visibility hotkeys and overlay flags. Loaded/saved in the
 GUI process (atomic writes, background save thread); never touches the daemon
 or remote workspace files.
 

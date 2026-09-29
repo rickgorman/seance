@@ -17,6 +17,27 @@ Unreleased work can sit under `## [Unreleased]` until the version bump.
 
 ## [Unreleased]
 
+## [0.26.4] — 2026-09-29
+
+### Added
+
+- Named Seances in Settings → Windows: give each window a name and its own
+  collection of sidebar tabs, with an independent visibility hotkey. Moving
+  a tab transfers it between windows; unassigned tabs stay in Main. Removing
+  a Seance returns its tabs to Main without stopping terminal sessions.
+  Existing single-workspace windows migrate automatically.
+- An **Overlay** checkbox for Main and each named Seance (macOS): summon the
+  window above the current Space on the screen under the pointer, then hide
+  it back to the previous app. Overlays also hide when switching to another
+  app. Ordinary windows retain their normal behavior when Overlay is off.
+
+### Fixed
+
+- Opening Settings → Colors no longer crashes: the Settings window now has
+  the GPUI component root its text fields require.
+- Command-W closes Settings, including while editing a color or recording a
+  shortcut, without closing terminal sessions.
+
 ## [0.26.3] — 2026-09-28
 
 ### Added

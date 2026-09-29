@@ -256,36 +256,37 @@ impl SeanceApp {
         };
 
         if n == 0 {
-            if let Some(ws) = self.window_scope.fixed_workspace() {
-                if !self.scoped_target_available {
-                    let label = self.workspace_label(ws);
-                    return div()
-                        .flex_1()
-                        .h_full()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .text_color(SeancePalette::flame_dim())
-                                        .text_2xl()
-                                        .child("✦"),
-                                )
-                                .child(
-                                    div()
-                                        .text_color(SeancePalette::flame_dim())
-                                        .text_sm()
-                                        .child(format!("“{label}” is not available on the daemon")),
-                                ),
-                        )
-                        .into_any_element();
-                }
+            if self.window_scope.seance_id().is_some() && self.workspaces().is_empty() {
+                return div()
+                    .flex_1()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_color(SeancePalette::flame_dim())
+                                    .text_2xl()
+                                    .child("✦"),
+                            )
+                            .child(
+                                div()
+                                    .text_color(SeancePalette::flame_dim())
+                                    .text_sm()
+                                    .text_center()
+                                    .child(format!(
+                                        "“{}” has no circles yet.\nMove circles here in Settings → Windows, or start one with ◈+",
+                                        self.window_heading()
+                                    )),
+                            ),
+                    )
+                    .into_any_element();
             }
             // A second window with no subscriptions yet gets the summon
             // instructions, not the summon hint (empty_window is sticky for

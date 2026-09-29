@@ -3,7 +3,7 @@
 //! Font family/size and app-global keyboard chords live here — not on the daemon.
 //! See `CLAUDE.md` for the thin-client exception.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock, RwLock};
 
@@ -180,12 +180,60 @@ impl Chord {
     }
 }
 
-/// One OS window dedicated to a single workspace slug.
+/// Legacy (0.26.3) OS window dedicated to a single workspace slug. Read once
+/// to seed [`DesktopPrefs::seances`]; never registered or edited after that.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceWindowDefinition {
     pub workspace: String,
     #[serde(default)]
     pub shortcut: Option<Chord>,
+}
+
+/// A named Seance: its own OS window and hotkey, showing a user-chosen set of
+/// circles out of the shared catalog. `id` is the identity — hotkey
+/// registrations, live windows and Settings rows all key on it — and never
+/// changes; `name` is only a label. A circle belongs to at most one Seance;
+/// circles in none of them are the main window's.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeanceDef {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    /// Circle slugs (slugs never change on rename, so membership doesn't either).
+    #[serde(default)]
+    pub members: Vec<String>,
+    #[serde(default)]
+    pub shortcut: Option<Chord>,
+    /// Float over the current Space and hand focus back on hide (macOS).
+    #[serde(default)]
+    pub overlay: bool,
+}
+
+/// A window that can carry a global show/hide hotkey — the single lane every
+/// conflict check, registration and Settings capture goes through.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum WindowSlot {
+    Main,
+    Seance(String),
+}
+
+/// Which circles a window shows, derived from prefs alone (never from what
+/// the connection happens to be subscribed to).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Projection {
+    All,
+    Only(BTreeSet<String>),
+    Except(BTreeSet<String>),
+}
+
+impl Projection {
+    pub fn admits(&self, workspace: &str) -> bool {
+        match self {
+            Projection::All => true,
+            Projection::Only(set) => set.contains(workspace),
+            Projection::Except(set) => !set.contains(workspace),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -200,9 +248,18 @@ pub struct DesktopPrefs {
     /// System-wide show/hide for the primary Seance window (macOS).
     #[serde(default)]
     pub main_window_hotkey: Option<Chord>,
-    /// Additional workspace-tied OS windows.
+    /// Float the main window over the current Space (macOS).
+    #[serde(default)]
+    pub main_window_overlay: bool,
+    /// Legacy single-circle windows, kept verbatim so a rollback still finds
+    /// them. Inactive once `seances` exists.
     #[serde(default)]
     pub workspace_windows: Vec<WorkspaceWindowDefinition>,
+    /// Named Seances. `None` = not yet migrated from `workspace_windows`;
+    /// `Some` — even empty — is authoritative, so deleting every Seance
+    /// doesn't bring the legacy windows back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seances: Option<Vec<SeanceDef>>,
     /// Terminal ANSI / default colors for native panes (device-local).
     #[serde(default)]
     pub terminal_color_scheme: ColorScheme,
@@ -223,10 +280,256 @@ impl Default for DesktopPrefs {
             font_size: FONT_SIZE_DEFAULT,
             shortcuts: HashMap::new(),
             main_window_hotkey: None,
+            main_window_overlay: false,
             workspace_windows: Vec::new(),
+            seances: None,
             terminal_color_scheme: ColorScheme::default(),
         }
     }
+}
+
+impl DesktopPrefs {
+    pub fn seance_defs(&self) -> &[SeanceDef] {
+        self.seances.as_deref().unwrap_or(&[])
+    }
+
+    pub fn seance(&self, id: &str) -> Option<&SeanceDef> {
+        self.seance_defs().iter().find(|d| d.id == id)
+    }
+
+    fn seance_mut(&mut self, id: &str) -> Option<&mut SeanceDef> {
+        self.seances.as_mut()?.iter_mut().find(|d| d.id == id)
+    }
+
+    /// The Seance a circle belongs to, if any (None = main window).
+    pub fn owner_of(&self, workspace: &str) -> Option<&SeanceDef> {
+        self.seance_defs()
+            .iter()
+            .find(|d| d.members.iter().any(|m| m == workspace))
+    }
+
+    pub fn overlay_for(&self, slot: &WindowSlot) -> bool {
+        match slot {
+            WindowSlot::Main => self.main_window_overlay,
+            WindowSlot::Seance(id) => self.seance(id).is_some_and(|d| d.overlay),
+        }
+    }
+
+    /// Human label for a slot (conflict messages, window titles).
+    pub fn slot_label(&self, slot: &WindowSlot) -> String {
+        match slot {
+            WindowSlot::Main => "main window".into(),
+            WindowSlot::Seance(id) => self
+                .seance(id)
+                .map(|d| d.name.clone())
+                .unwrap_or_else(|| id.clone()),
+        }
+    }
+}
+
+/// Every bound window hotkey, main first. Legacy `workspace_windows` are not
+/// here: after migration they are inert.
+pub fn window_hotkey_slots(prefs: &DesktopPrefs) -> Vec<(WindowSlot, Chord)> {
+    let mut out = Vec::new();
+    if let Some(c) = prefs.main_window_hotkey.clone() {
+        out.push((WindowSlot::Main, c));
+    }
+    for def in prefs.seance_defs() {
+        if let Some(c) = def.shortcut.clone() {
+            out.push((WindowSlot::Seance(def.id.clone()), c));
+        }
+    }
+    out
+}
+
+/// Main shows every circle no Seance claims; a Seance shows exactly its
+/// members (a missing id shows nothing — never a guess).
+pub fn projection_for(prefs: &DesktopPrefs, seance: Option<&str>) -> Projection {
+    match seance {
+        None => {
+            let claimed: BTreeSet<String> = prefs
+                .seance_defs()
+                .iter()
+                .flat_map(|d| d.members.iter().cloned())
+                .collect();
+            if claimed.is_empty() {
+                Projection::All
+            } else {
+                Projection::Except(claimed)
+            }
+        }
+        Some(id) => Projection::Only(
+            prefs
+                .seance(id)
+                .map(|d| d.members.iter().cloned().collect())
+                .unwrap_or_default(),
+        ),
+    }
+}
+
+/// Fresh immutable id: time-based, bumped past any id already in use.
+fn fresh_seance_id(prefs: &DesktopPrefs, now: u64) -> String {
+    let mut n = now;
+    loop {
+        let id = format!("s{n:x}");
+        if prefs.seance(&id).is_none() {
+            return id;
+        }
+        n += 1;
+    }
+}
+
+fn clean_seance_name(
+    prefs: &DesktopPrefs,
+    name: &str,
+    skip: Option<&str>,
+) -> Result<String, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("Give the Seance a name.".into());
+    }
+    let taken = prefs
+        .seance_defs()
+        .iter()
+        .filter(|d| Some(d.id.as_str()) != skip)
+        .any(|d| d.name.eq_ignore_ascii_case(name));
+    if taken {
+        return Err(format!("A Seance named “{name}” already exists."));
+    }
+    Ok(name.to_string())
+}
+
+/// Create an empty named Seance; returns its id.
+pub fn create_seance_in(prefs: &mut DesktopPrefs, name: &str, now: u64) -> Result<String, String> {
+    let name = clean_seance_name(prefs, name, None)?;
+    let id = fresh_seance_id(prefs, now);
+    prefs.seances.get_or_insert_with(Vec::new).push(SeanceDef {
+        id: id.clone(),
+        name,
+        members: Vec::new(),
+        shortcut: None,
+        overlay: false,
+    });
+    Ok(id)
+}
+
+pub fn rename_seance_in(prefs: &mut DesktopPrefs, id: &str, name: &str) -> Result<(), String> {
+    let name = clean_seance_name(prefs, name, Some(id))?;
+    let def = prefs
+        .seance_mut(id)
+        .ok_or_else(|| "That Seance no longer exists.".to_string())?;
+    def.name = name;
+    Ok(())
+}
+
+/// Drop a Seance. Its circles simply become unassigned (main window's).
+pub fn remove_seance_in(prefs: &mut DesktopPrefs, id: &str) -> Option<SeanceDef> {
+    let list = prefs.seances.as_mut()?;
+    let pos = list.iter().position(|d| d.id == id)?;
+    Some(list.remove(pos))
+}
+
+/// Move a circle into `target` (None = back to the main window). Membership
+/// is exclusive: the circle leaves whichever Seance held it. Returns whether
+/// anything changed; an unknown target changes nothing.
+pub fn assign_circle_in(prefs: &mut DesktopPrefs, workspace: &str, target: Option<&str>) -> bool {
+    if let Some(id) = target {
+        if prefs.seance(id).is_none() {
+            return false;
+        }
+        if prefs
+            .seance(id)
+            .is_some_and(|d| d.members.iter().any(|m| m == workspace))
+        {
+            return false;
+        }
+    }
+    let mut changed = false;
+    if let Some(list) = prefs.seances.as_mut() {
+        for def in list.iter_mut() {
+            let before = def.members.len();
+            def.members.retain(|m| m != workspace);
+            changed |= def.members.len() != before;
+        }
+    }
+    if let Some(def) = target.and_then(|id| prefs.seance_mut(id)) {
+        def.members.push(workspace.to_string());
+        changed = true;
+    }
+    changed
+}
+
+pub fn set_overlay_in(prefs: &mut DesktopPrefs, slot: &WindowSlot, on: bool) -> bool {
+    match slot {
+        WindowSlot::Main => {
+            let changed = prefs.main_window_overlay != on;
+            prefs.main_window_overlay = on;
+            changed
+        }
+        WindowSlot::Seance(id) => match prefs.seance_mut(id) {
+            Some(def) if def.overlay != on => {
+                def.overlay = on;
+                true
+            }
+            _ => false,
+        },
+    }
+}
+
+/// Every legacy window becomes a single-circle Seance. The id is derived from
+/// the slug, so re-parsing an unsaved file gives the same ids.
+fn seances_from_legacy(legacy: &[WorkspaceWindowDefinition]) -> Vec<SeanceDef> {
+    legacy
+        .iter()
+        .filter_map(|d| {
+            let slug = d.workspace.trim();
+            (!slug.is_empty()).then(|| SeanceDef {
+                id: format!("ws-{slug}"),
+                name: slug.to_string(),
+                members: vec![slug.to_string()],
+                shortcut: d.shortcut.clone(),
+                overlay: false,
+            })
+        })
+        .collect()
+}
+
+/// Migrate once, then repair what a hand edit (or an older build) could leave
+/// behind: duplicate ids, blank names, a circle claimed twice (first claim
+/// wins), and window hotkeys that collide — only the offending row's hotkey
+/// is dropped, never the rest.
+fn sanitize_seances(prefs: &mut DesktopPrefs, mac: bool) {
+    let raw = match prefs.seances.take() {
+        Some(list) => list,
+        None => seances_from_legacy(&prefs.workspace_windows),
+    };
+    let mut out: Vec<SeanceDef> = Vec::new();
+    let mut claimed = HashSet::new();
+    for mut def in raw {
+        def.id = def.id.trim().to_string();
+        if def.id.is_empty() || out.iter().any(|d| d.id == def.id) {
+            continue;
+        }
+        def.name = def.name.trim().to_string();
+        if def.name.is_empty() {
+            def.name = def.id.clone();
+        }
+        def.members = std::mem::take(&mut def.members)
+            .into_iter()
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty() && claimed.insert(m.clone()))
+            .collect();
+        if let Some(chord) = def.shortcut.take() {
+            let mut scratch = prefs.clone();
+            scratch.seances = Some(out.clone());
+            match validate_window_hotkey_candidate(&scratch, &chord, None, mac) {
+                Ok(()) => def.shortcut = Some(normalize_chord(&chord)),
+                Err(e) => eprintln!("ignoring window hotkey for Seance “{}”: {e:?}", def.name),
+            }
+        }
+        out.push(def);
+    }
+    prefs.seances = Some(out);
 }
 
 pub fn config_path() -> PathBuf {
@@ -626,22 +929,17 @@ pub fn schedule_desktop_save() {
 }
 
 fn all_window_hotkey_chords(prefs: &DesktopPrefs) -> Vec<Chord> {
-    let mut out = Vec::new();
-    if let Some(c) = prefs.main_window_hotkey.clone() {
-        out.push(normalize_chord(&c));
-    }
-    for def in &prefs.workspace_windows {
-        if let Some(c) = def.shortcut.clone() {
-            out.push(normalize_chord(&c));
-        }
-    }
-    out
+    window_hotkey_slots(prefs)
+        .into_iter()
+        .map(|(_, c)| normalize_chord(&c))
+        .collect()
 }
 
+/// `skip` is the slot being rebound — its own current chord isn't a conflict.
 pub fn validate_window_hotkey_candidate(
     prefs: &DesktopPrefs,
     chord: &Chord,
-    skip_workspace_index: Option<usize>,
+    skip: Option<&WindowSlot>,
     mac: bool,
 ) -> Result<(), BindError> {
     let c = normalize_chord(chord);
@@ -658,19 +956,9 @@ pub fn validate_window_hotkey_candidate(
             }
         }
     }
-    if let Some(main) = prefs.main_window_hotkey.as_ref() {
-        if normalize_chord(main) == c {
+    for (slot, used) in window_hotkey_slots(prefs) {
+        if skip != Some(&slot) && normalize_chord(&used) == c {
             return Err(BindError::ConflictWindowHotkey);
-        }
-    }
-    for (i, def) in prefs.workspace_windows.iter().enumerate() {
-        if skip_workspace_index == Some(i) {
-            continue;
-        }
-        if let Some(sc) = def.shortcut.as_ref() {
-            if normalize_chord(sc) == c {
-                return Err(BindError::ConflictWindowHotkey);
-            }
         }
     }
     Ok(())
@@ -868,6 +1156,7 @@ fn sanitize_prefs(
     }
     let mac = cfg!(target_os = "macos");
     prefs.shortcuts = sanitize_shortcuts(prefs.shortcuts, mac);
+    sanitize_seances(&mut prefs, mac);
     prefs
 }
 
@@ -958,6 +1247,18 @@ pub fn reset_color_scheme_defaults() {
     prefs.terminal_color_scheme = scheme.clone();
     colors::apply_palette(scheme);
     schedule_save();
+}
+
+/// Apply a Seance edit to the live prefs, saving only when it changed
+/// something. Window side effects (retitle, reproject, hotkeys) belong to
+/// `WindowHotkeys`, which calls these.
+pub fn edit_seances<T>(f: impl FnOnce(&mut DesktopPrefs) -> T, changed: impl Fn(&T) -> bool) -> T {
+    let mut prefs = desktop_prefs().write().unwrap();
+    let out = f(&mut prefs);
+    if changed(&out) {
+        schedule_save();
+    }
+    out
 }
 
 fn spawn_save_thread() {
@@ -1413,5 +1714,223 @@ mod tests {
         let installed: HashSet<String> = HashSet::new();
         let back = parse_prefs_json(&json, &installed, None);
         assert_eq!(back.terminal_color_scheme.background.to_hex(), "#222222");
+    }
+
+    /// ctrl+alt+cmd+key: no app shortcut uses it, so window-hotkey tests
+    /// exercise only window-vs-window rules.
+    fn win_chord(key: &str) -> Chord {
+        Chord {
+            ctrl: true,
+            alt: true,
+            shift: false,
+            meta: true,
+            key: normalize_key(key),
+        }
+    }
+
+    fn legacy_json() -> String {
+        let mut prefs = DesktopPrefs::default();
+        prefs.font_size = 17.0;
+        prefs.main_window_hotkey = Some(make_chord(false, true, true, "m"));
+        prefs.workspace_windows = vec![
+            WorkspaceWindowDefinition {
+                workspace: "nuance".into(),
+                shortcut: Some(win_chord("1")),
+            },
+            WorkspaceWindowDefinition {
+                workspace: "home".into(),
+                shortcut: None,
+            },
+        ];
+        let json = serde_json::to_string(&prefs).unwrap();
+        assert!(!json.contains("\"seances\""));
+        json
+    }
+
+    #[test]
+    fn legacy_workspace_windows_migrate_to_single_circle_seances() {
+        let installed: HashSet<String> = HashSet::new();
+        let p = parse_prefs_json(&legacy_json(), &installed, None);
+        let defs = p.seance_defs();
+        assert_eq!(defs.len(), 2);
+        assert_eq!(defs[0].id, "ws-nuance");
+        assert_eq!(defs[0].name, "nuance");
+        assert_eq!(defs[0].members, vec!["nuance".to_string()]);
+        assert_eq!(defs[0].shortcut, Some(win_chord("1")));
+        assert!(!defs[0].overlay);
+        assert_eq!(defs[1].shortcut, None);
+        // Everything else rides along untouched, legacy list included.
+        assert_eq!(p.font_size, 17.0);
+        assert_eq!(
+            p.main_window_hotkey,
+            Some(make_chord(false, true, true, "m"))
+        );
+        assert_eq!(p.workspace_windows.len(), 2);
+    }
+
+    #[test]
+    fn migration_is_idempotent_and_survives_save_reload() {
+        let installed: HashSet<String> = HashSet::new();
+        let once = parse_prefs_json(&legacy_json(), &installed, None);
+        let twice = parse_prefs_json(&legacy_json(), &installed, None);
+        assert_eq!(once.seances, twice.seances);
+        let saved = serde_json::to_string(&once).unwrap();
+        let reloaded = parse_prefs_json(&saved, &installed, None);
+        assert_eq!(reloaded.seances, once.seances);
+        assert_eq!(reloaded.workspace_windows, once.workspace_windows);
+    }
+
+    #[test]
+    fn empty_seance_list_is_authoritative_and_never_remigrates() {
+        let installed: HashSet<String> = HashSet::new();
+        let mut p = parse_prefs_json(&legacy_json(), &installed, None);
+        for id in ["ws-nuance", "ws-home"] {
+            remove_seance_in(&mut p, id).unwrap();
+        }
+        let saved = serde_json::to_string(&p).unwrap();
+        let reloaded = parse_prefs_json(&saved, &installed, None);
+        assert_eq!(reloaded.seances, Some(Vec::new()));
+        assert!(window_hotkey_slots(&reloaded)
+            .iter()
+            .all(|(slot, _)| *slot == WindowSlot::Main));
+    }
+
+    #[test]
+    fn sanitize_keeps_first_claim_and_drops_only_the_colliding_hotkey() {
+        let installed: HashSet<String> = HashSet::new();
+        let m = make_chord(false, true, true, "m");
+        let mut prefs = DesktopPrefs::default();
+        prefs.main_window_hotkey = Some(m.clone());
+        prefs.seances = Some(vec![
+            SeanceDef {
+                id: "a".into(),
+                name: "  ".into(),
+                members: vec!["x".into(), "y".into()],
+                shortcut: Some(make_chord(false, true, true, "a")),
+                overlay: true,
+            },
+            SeanceDef {
+                id: "b".into(),
+                name: "Beta".into(),
+                members: vec!["y".into(), "z".into()],
+                shortcut: Some(m),
+                overlay: false,
+            },
+            SeanceDef {
+                id: "a".into(),
+                name: "dup".into(),
+                members: vec!["w".into()],
+                shortcut: None,
+                overlay: false,
+            },
+        ]);
+        let json = serde_json::to_string(&prefs).unwrap();
+        let p = parse_prefs_json(&json, &installed, None);
+        let defs = p.seance_defs();
+        assert_eq!(defs.len(), 2);
+        assert_eq!(defs[0].name, "a");
+        assert_eq!(defs[0].members, vec!["x".to_string(), "y".to_string()]);
+        assert!(defs[0].shortcut.is_some());
+        assert!(defs[0].overlay);
+        assert_eq!(defs[1].members, vec!["z".to_string()]);
+        assert_eq!(defs[1].shortcut, None);
+        assert!(p.main_window_hotkey.is_some());
+    }
+
+    #[test]
+    fn assign_moves_exclusively_and_none_returns_to_main() {
+        let mut p = DesktopPrefs::default();
+        let a = create_seance_in(&mut p, "Client work", 5).unwrap();
+        let b = create_seance_in(&mut p, "JoyRudder", 5).unwrap();
+        assert_ne!(a, b);
+        assert!(assign_circle_in(&mut p, "nuance", Some(&a)));
+        assert!(!assign_circle_in(&mut p, "nuance", Some(&a)));
+        assert!(assign_circle_in(&mut p, "nuance", Some(&b)));
+        assert!(p.seance(&a).unwrap().members.is_empty());
+        assert_eq!(p.owner_of("nuance").map(|d| d.id.clone()), Some(b.clone()));
+        assert!(!assign_circle_in(&mut p, "nuance", Some("gone")));
+        assert_eq!(p.owner_of("nuance").map(|d| d.id.clone()), Some(b.clone()));
+        assert!(assign_circle_in(&mut p, "nuance", None));
+        assert!(p.owner_of("nuance").is_none());
+        assert!(!assign_circle_in(&mut p, "nuance", None));
+    }
+
+    #[test]
+    fn removing_a_seance_returns_its_circles_to_main() {
+        let mut p = DesktopPrefs::default();
+        let a = create_seance_in(&mut p, "Client work", 5).unwrap();
+        assign_circle_in(&mut p, "nuance", Some(&a));
+        assert!(!projection_for(&p, None).admits("nuance"));
+        let removed = remove_seance_in(&mut p, &a).unwrap();
+        assert_eq!(removed.members, vec!["nuance".to_string()]);
+        assert!(projection_for(&p, None).admits("nuance"));
+        assert_eq!(
+            projection_for(&p, Some(&a)),
+            Projection::Only(BTreeSet::new())
+        );
+        assert!(remove_seance_in(&mut p, &a).is_none());
+    }
+
+    #[test]
+    fn projection_main_is_all_without_seances_and_except_claimed_with_them() {
+        let mut p = DesktopPrefs::default();
+        assert_eq!(projection_for(&p, None), Projection::All);
+        let a = create_seance_in(&mut p, "Client work", 5).unwrap();
+        // An empty Seance claims nothing: main still shows everything.
+        assert_eq!(projection_for(&p, None), Projection::All);
+        assign_circle_in(&mut p, "nuance", Some(&a));
+        assert!(!projection_for(&p, None).admits("nuance"));
+        assert!(projection_for(&p, None).admits("home"));
+        assert!(projection_for(&p, Some(&a)).admits("nuance"));
+        assert!(!projection_for(&p, Some(&a)).admits("home"));
+        assert!(!projection_for(&p, Some("missing")).admits("nuance"));
+    }
+
+    #[test]
+    fn names_are_required_unique_and_rename_keeps_identity() {
+        let mut p = DesktopPrefs::default();
+        assert!(create_seance_in(&mut p, "   ", 1).is_err());
+        let a = create_seance_in(&mut p, " Personal ", 1).unwrap();
+        assert_eq!(p.seance(&a).unwrap().name, "Personal");
+        assert!(create_seance_in(&mut p, "personal", 1).is_err());
+        let b = create_seance_in(&mut p, "Client", 1).unwrap();
+        assert!(rename_seance_in(&mut p, &b, "PERSONAL").is_err());
+        rename_seance_in(&mut p, &a, "personal").unwrap();
+        rename_seance_in(&mut p, &a, "Home stuff").unwrap();
+        assert_eq!(p.seance(&a).unwrap().id, a);
+        assert_eq!(p.slot_label(&WindowSlot::Seance(a)), "Home stuff");
+    }
+
+    #[test]
+    fn window_hotkey_validation_skips_only_the_rebound_slot() {
+        let mac = cfg!(target_os = "macos");
+        let mut p = DesktopPrefs::default();
+        let a = create_seance_in(&mut p, "A", 1).unwrap();
+        let chord = win_chord("2");
+        p.seances.as_mut().unwrap()[0].shortcut = Some(chord.clone());
+        let slot = WindowSlot::Seance(a);
+        assert!(validate_window_hotkey_candidate(&p, &chord, Some(&slot), mac).is_ok());
+        assert_eq!(
+            validate_window_hotkey_candidate(&p, &chord, Some(&WindowSlot::Main), mac),
+            Err(BindError::ConflictWindowHotkey)
+        );
+    }
+
+    #[test]
+    fn overlay_defaults_off_and_toggles_per_slot() {
+        let mut p = DesktopPrefs::default();
+        let a = create_seance_in(&mut p, "A", 1).unwrap();
+        let slot = WindowSlot::Seance(a);
+        assert!(!p.overlay_for(&WindowSlot::Main));
+        assert!(!p.overlay_for(&slot));
+        assert!(set_overlay_in(&mut p, &slot, true));
+        assert!(!set_overlay_in(&mut p, &slot, true));
+        assert!(p.overlay_for(&slot));
+        assert!(!p.overlay_for(&WindowSlot::Main));
+        assert!(!set_overlay_in(
+            &mut p,
+            &WindowSlot::Seance("gone".into()),
+            true
+        ));
     }
 }

@@ -11,7 +11,9 @@ use std::time::{Duration, Instant};
 
 use gpui::{Context, Window};
 
+use super::preferences::Projection;
 use super::util::now_ms;
+use super::window_hotkeys::WindowScope;
 use seance_core::grouping::{Section, SectionRow};
 use seance_core::util::{rail_prefs_is_foreign, recency_rank, settle_absent};
 
@@ -48,26 +50,91 @@ pub(super) fn workspace_catalog_from_state(
     known
 }
 
-/// Whether an incremental event's workspace belongs in this window's projection.
-pub(super) fn workspace_in_window_scope(fixed: Option<&str>, workspace: &str) -> bool {
-    fixed.is_none_or(|f| workspace == f)
-}
-
-/// Whether a pane slug event should touch local state in a dedicated window.
-pub(super) fn slug_in_window_scope(fixed: Option<&str>, pane_workspace: Option<&str>) -> bool {
-    match fixed {
-        None => true,
-        Some(f) => pane_workspace == Some(f),
+/// Whether a pane-keyed event should touch local state. Only panes this
+/// window already holds (so, projected ones) qualify once a projection is in
+/// force; an unprojected window keeps its old accept-everything behavior.
+pub(super) fn slug_in_window_scope(proj: &Projection, pane_workspace: Option<&str>) -> bool {
+    match proj {
+        Projection::All => true,
+        _ => pane_workspace.is_some_and(|w| proj.admits(w)),
     }
 }
 
-/// Dedicated windows subscribe only when the bound slug is in the global catalog.
-pub(super) fn scoped_window_should_subscribe(
-    target: &str,
+/// Circles this window still needs the daemon to stream. Only circles the
+/// daemon actually knows — an absent member is never subscribed (that would
+/// recreate it). A Seance asks for its members; every other window keeps
+/// streaming everything (retained streams are filtered at ingest).
+pub(super) fn subscriptions_to_request(
+    scope: &WindowScope,
+    proj: &Projection,
     global_known: &BTreeSet<String>,
     daemon_subscriptions: &[String],
-) -> bool {
-    global_known.contains(target) && !daemon_subscriptions.iter().any(|s| s == target)
+) -> Vec<String> {
+    if scope.is_blank() {
+        return Vec::new();
+    }
+    global_known
+        .iter()
+        .filter(|w| scope.seance_id().is_none() || proj.admits(w))
+        .filter(|w| !daemon_subscriptions.iter().any(|s| s == *w))
+        .cloned()
+        .collect()
+}
+
+/// Fold keys for every cluster that exists ANYWHERE in the catalog. Pruning
+/// against one window's projection would drop folds that belong to circles
+/// another window shows, and the next pin would push that loss to everyone.
+pub(super) fn live_group_keys(
+    circles: &[String],
+    pinned: &BTreeSet<String>,
+    label_of: impl Fn(&str) -> String,
+) -> BTreeSet<String> {
+    seance_core::grouping::partition_sections(circles, pinned)
+        .into_iter()
+        .flat_map(|(section, members)| {
+            seance_core::grouping::group_by_prefix(&members, &label_of)
+                .into_iter()
+                .filter_map(move |row| match row {
+                    SectionRow::Group { prefix, .. } => {
+                        Some(crate::subscriptions_pref::group_key(section.key(), &prefix))
+                    }
+                    SectionRow::Circle(_) => None,
+                })
+        })
+        .collect()
+}
+
+/// Display labels for every circle in a `State` (slug → name; absent = slug).
+pub(super) fn labels_from_meta(
+    meta: &[seance_core::protocol::WorkspaceMeta],
+) -> std::collections::HashMap<String, String> {
+    meta.iter()
+        .filter_map(|m| Some((m.workspace.clone(), m.name.clone()?)))
+        .collect()
+}
+
+/// Where selection lands when the selected circle is banished: the circle
+/// below it in sidebar order, else the one above; None when it's alone.
+fn banish_neighbor(order: &[String], workspace: &str) -> Option<String> {
+    let idx = order.iter().position(|w| w == workspace)?;
+    order
+        .get(idx + 1)
+        .or_else(|| idx.checked_sub(1).and_then(|j| order.get(j)))
+        .cloned()
+}
+
+/// First `circle-N` free in the GLOBAL catalog — a name another window
+/// already shows must not be reused just because this window can't see it.
+pub(super) fn fresh_circle_name<'a>(taken: impl IntoIterator<Item = &'a String>) -> String {
+    let taken: std::collections::HashSet<&str> = taken.into_iter().map(String::as_str).collect();
+    let mut n = taken.len() + 1;
+    loop {
+        let candidate = format!("circle-{n}");
+        if !taken.contains(candidate.as_str()) {
+            return candidate;
+        }
+        n += 1;
+    }
 }
 
 /// Coarse one-unit relative time for sidebar labels.
@@ -243,11 +310,6 @@ impl SeanceApp {
     /// a circle created or renamed since the last `State` isn't in the
     /// connection's set until we ask for it.
     pub(super) fn reconcile_subscriptions(&mut self, global_known: &BTreeSet<String>) {
-        let fixed = self.window_scope.fixed_workspace().map(str::to_string);
-        if let Some(fixed) = fixed {
-            self.reconcile_subscriptions_scoped(&fixed, global_known);
-            return;
-        }
         let subs = self.subscriptions.clone();
         let mut changed = false;
         if !self.subs_seeded {
@@ -277,52 +339,21 @@ impl SeanceApp {
         changed |= self.subs_pref.prune(&protected);
         // A cluster that no longer exists shouldn't leave a fold behind to
         // surprise you when that name comes back.
-        let live_groups: std::collections::BTreeSet<String> = self
-            .workspace_sections()
-            .into_iter()
-            .flat_map(|(section, circles)| {
-                self.section_rows(&circles)
-                    .into_iter()
-                    .filter_map(move |row| match row {
-                        SectionRow::Group { prefix, .. } => {
-                            Some(crate::subscriptions_pref::group_key(section.key(), &prefix))
-                        }
-                        SectionRow::Circle(_) => None,
-                    })
-            })
-            .collect();
+        let every: Vec<String> = global_known.iter().cloned().collect();
+        let live_groups = live_group_keys(&every, &self.subs_pref.pinned, |ws| {
+            self.workspace_label(ws)
+        });
         changed |= self.subs_pref.prune_collapsed(&live_groups);
         if changed {
             self.save_arrangement_local();
         }
         // Anything the daemon isn't streaming yet (reconnect, rename, a circle
-        // ctl just spawned) gets subscribed so its grids flow.
-        if !self.window_scope.is_blank() {
-            let missing: Vec<String> = global_known
-                .iter()
-                .filter(|w| !subs.iter().any(|s| s == *w))
-                .cloned()
-                .collect();
-            for ws in missing {
-                let _ = self.client.subscribe(&ws);
-            }
-        }
-    }
-
-    /// Dedicated workspace window: never seed/prune the shared rail from a
-    /// projected catalog — only catch up subscription for the bound slug.
-    fn reconcile_subscriptions_scoped(&mut self, fixed: &str, global_known: &BTreeSet<String>) {
-        let subs = self.subscriptions.clone();
-        let live = global_known.contains(fixed);
-        self.scoped_target_available = live;
-        if scoped_window_should_subscribe(fixed, global_known, &subs) {
-            let _ = self.client.subscribe(fixed);
-        }
-        if live && self.selected_workspace.as_deref() != Some(fixed) {
-            self.selected_workspace = Some(fixed.to_string());
-            let _ = self.client.set_focus(None, Some(fixed.to_string()));
-        } else if !live {
-            self.selected_workspace = Some(fixed.to_string());
+        // ctl just spawned, a circle just moved into this Seance) gets
+        // subscribed so its grids flow.
+        for ws in
+            subscriptions_to_request(&self.window_scope, &self.projection, global_known, &subs)
+        {
+            let _ = self.client.subscribe(&ws);
         }
     }
 
@@ -559,13 +590,11 @@ impl SeanceApp {
     ///    circle, or right-click → "touch"). Selecting a workspace alone does
     ///    not bump touch. No manual drag-reorder.
     pub(super) fn workspaces(&self) -> Vec<String> {
-        if let Some(fixed) = self.window_scope.fixed_workspace() {
-            if self.known_workspace_names().contains(fixed) {
-                return vec![fixed.to_string()];
-            }
-            return vec![fixed.to_string()];
-        }
-        let mut out: Vec<String> = self.known_workspace_names().into_iter().collect();
+        let mut out: Vec<String> = self
+            .known_workspace_names()
+            .into_iter()
+            .filter(|ws| self.projection.admits(ws))
+            .collect();
         out.sort_by_key(|ws| self.workspace_sort_key(ws));
         out
     }
@@ -819,18 +848,10 @@ impl SeanceApp {
     }
 
     pub(super) fn create_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.window_scope.fixed_workspace().is_some() {
-            return;
-        }
-        let existing = self.known_workspace_names();
-        let mut n = existing.len() + 1;
-        let name = loop {
-            let candidate = format!("circle-{n}");
-            if !existing.contains(&candidate) {
-                break candidate;
-            }
-            n += 1;
-        };
+        let name = self.fresh_global_circle_name();
+        // A Seance claims the circle BEFORE the daemon hears of it, so the
+        // first State that mentions it already lands here, not in main.
+        self.claim_new_circle(&name, cx);
         let _ = self.client.create_workspace(&name);
         // Born here → looked at here; the daemon subscribes us on create.
         self.subs_pref.mark_seen(&name);
@@ -856,10 +877,8 @@ impl SeanceApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(fixed) = self.window_scope.fixed_workspace() {
-            if workspace != fixed {
-                return;
-            }
+        if !self.projection.admits(workspace) {
+            return;
         }
         let changed = self.selected_workspace.as_deref() != Some(workspace);
         // Selecting is looking — clears the `needs` badge. The daemon
@@ -1081,8 +1100,15 @@ impl SeanceApp {
         workspace: &str,
         cx: &mut Context<Self>,
     ) {
-        if let Some(fixed) = self.window_scope.fixed_workspace() {
-            if workspace != fixed {
+        if !self.projection.admits(workspace) {
+            // Moving a pane into a brand-new circle from a Seance claims the
+            // circle first; an existing circle this window doesn't show is
+            // off limits.
+            if self.global_workspaces.contains(workspace) {
+                return;
+            }
+            self.claim_new_circle(workspace, cx);
+            if !self.projection.admits(workspace) {
                 return;
             }
         }
@@ -1138,24 +1164,53 @@ impl SeanceApp {
     ) {
         // Banishing the ACTIVE circle: select the neighbor below (above when
         // last) in sidebar order — not the daemon's arbitrary first-pane
-        // fallback — so the human lands somewhere predictable.
-        if self.selected_workspace.as_deref() == Some(workspace) {
-            let order = self.visible_workspaces();
-            if let Some(idx) = order.iter().position(|w| w == workspace) {
-                let neighbor = order
-                    .get(idx + 1)
-                    .or_else(|| idx.checked_sub(1).and_then(|j| order.get(j)))
-                    .cloned();
-                if let Some(n) = neighbor {
-                    let _ = self.client.kill_workspace(workspace);
-                    self.select_workspace(&n, window, cx);
-                    cx.notify();
-                    return;
-                }
-            }
-        }
+        // fallback — so the human lands somewhere predictable. Picked before
+        // `forget_circle` reshapes this window's projection.
+        let neighbor = if self.selected_workspace.as_deref() == Some(workspace) {
+            banish_neighbor(&self.visible_workspaces(), workspace)
+        } else {
+            None
+        };
+        // One kill, and the circle leaves its Seance on every path — a dead
+        // slug left as a member would capture a later `circle-N` reuse.
         let _ = self.client.kill_workspace(workspace);
+        super::window_hotkeys::WindowHotkeys::forget_circle(cx, workspace);
+        if let Some(n) = neighbor {
+            self.select_workspace(&n, window, cx);
+        }
         cx.notify();
+    }
+
+    /// `circle-N` unused across the whole daemon catalog (plus the clock
+    /// census, which also spans every circle).
+    pub(super) fn fresh_global_circle_name(&self) -> String {
+        let local = self.known_workspace_names();
+        fresh_circle_name(
+            self.global_workspaces
+                .iter()
+                .chain(local.iter())
+                .chain(self.workspace_activity.keys())
+                .chain(self.workspace_touch.keys()),
+        )
+    }
+
+    /// A circle about to be created from this window: a Seance window adopts
+    /// it into its membership right now (prefs first, daemon second).
+    /// Main/blank windows leave it unassigned, which is where main looks.
+    pub(super) fn claim_new_circle(&mut self, workspace: &str, cx: &mut Context<Self>) {
+        let Some(id) = self.window_scope.seance_id().map(str::to_string) else {
+            return;
+        };
+        super::preferences::edit_seances(
+            |p| super::preferences::assign_circle_in(p, workspace, Some(&id)),
+            |c| *c,
+        );
+        self.projection = self
+            .window_scope
+            .projection(&super::preferences::desktop_prefs().read().unwrap());
+        // Other windows drop it if they happened to show it (they can't: it
+        // is new), and pick up the new membership for their own Except set.
+        super::window_hotkeys::WindowHotkeys::scopes_changed(cx);
     }
 }
 
@@ -1177,35 +1232,107 @@ mod tests {
         }
     }
 
+    fn only(names: &[&str]) -> Projection {
+        Projection::Only(names.iter().map(|s| s.to_string()).collect())
+    }
+
     #[test]
-    fn bound_workspace_id_is_not_known_without_daemon_evidence() {
+    fn seance_never_subscribes_an_absent_member() {
         let known = workspace_catalog_from_state(
-            std::iter::empty::<&str>(),
+            ["alpha"].into_iter(),
             &[],
             &[],
-            std::iter::empty::<&str>(),
+            ["beta"].into_iter(),
             None,
         );
-        assert!(!known.contains("deleted-circle"));
-        assert!(!scoped_window_should_subscribe(
-            "deleted-circle",
-            &known,
-            &[]
-        ));
+        let scope = WindowScope::Seance("s1".into());
+        let want = subscriptions_to_request(&scope, &only(&["alpha", "deleted"]), &known, &[]);
+        assert_eq!(want, vec!["alpha".to_string()]);
+        let none = subscriptions_to_request(&scope, &only(&["alpha"]), &known, &["alpha".into()]);
+        assert!(none.is_empty());
     }
 
     #[test]
-    fn other_workspace_pane_spawn_is_out_of_scope() {
-        assert!(!workspace_in_window_scope(Some("alpha"), "beta"));
-        assert!(workspace_in_window_scope(Some("alpha"), "alpha"));
-        assert!(workspace_in_window_scope(None, "any"));
+    fn main_keeps_streaming_everything_and_blank_nothing() {
+        let known: BTreeSet<String> = ["a", "b"].map(str::to_string).into_iter().collect();
+        let except = Projection::Except(["a".to_string()].into_iter().collect());
+        assert_eq!(
+            subscriptions_to_request(&WindowScope::Main, &except, &known, &[]),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert!(
+            subscriptions_to_request(&WindowScope::Blank, &Projection::All, &known, &[]).is_empty()
+        );
     }
 
     #[test]
-    fn slug_events_ignore_unknown_panes_in_dedicated_windows() {
-        assert!(!slug_in_window_scope(Some("alpha"), Some("beta")));
-        assert!(!slug_in_window_scope(Some("alpha"), None));
-        assert!(slug_in_window_scope(None, None));
+    fn slug_events_only_reach_projected_panes() {
+        let p = only(&["alpha"]);
+        assert!(!slug_in_window_scope(&p, Some("beta")));
+        assert!(!slug_in_window_scope(&p, None));
+        assert!(slug_in_window_scope(&p, Some("alpha")));
+        assert!(slug_in_window_scope(&Projection::All, None));
+        let main = Projection::Except(["alpha".to_string()].into_iter().collect());
+        assert!(!slug_in_window_scope(&main, Some("alpha")));
+        assert!(slug_in_window_scope(&main, Some("beta")));
+    }
+
+    #[test]
+    fn fold_keys_come_from_the_whole_catalog_not_the_projection() {
+        // "nuance-*" lives in a Seance; main alone would see no cluster and
+        // prune the fold the Seance window relies on.
+        let all = ["nuance-api", "nuance-web", "home"].map(str::to_string);
+        let pinned = BTreeSet::new();
+        let keys = live_group_keys(&all, &pinned, |s| s.to_string());
+        assert!(keys.contains(&crate::subscriptions_pref::group_key("active", "nuance")));
+        let main_only = live_group_keys(&["home".to_string()], &pinned, |s| s.to_string());
+        assert!(main_only.is_empty());
+    }
+
+    #[test]
+    fn fold_keys_group_by_labels_ingested_before_prune() {
+        // Random slugs, human labels: only the labels cluster. A fresh
+        // window that pruned before reading this State's labels would see
+        // two unrelated slugs and drop the "client" fold.
+        let meta: Vec<seance_core::protocol::WorkspaceMeta> = [
+            ("x7k2", Some("Client-api")),
+            ("q9pd", Some("Client-web")),
+            ("home", None),
+        ]
+        .into_iter()
+        .map(|(ws, name)| {
+            serde_json::from_value(serde_json::json!({ "workspace": ws, "name": name })).unwrap()
+        })
+        .collect();
+        let labels = labels_from_meta(&meta);
+        assert_eq!(labels.len(), 2);
+        let all: Vec<String> = meta.iter().map(|m| m.workspace.clone()).collect();
+        let pinned = BTreeSet::new();
+        let key = crate::subscriptions_pref::group_key("active", "client");
+        let with_labels = live_group_keys(&all, &pinned, |ws| {
+            labels.get(ws).cloned().unwrap_or_else(|| ws.to_string())
+        });
+        assert!(with_labels.contains(&key));
+        let slugs_only = live_group_keys(&all, &pinned, |ws| ws.to_string());
+        assert!(!slugs_only.contains(&key));
+    }
+
+    #[test]
+    fn banish_neighbor_prefers_below_then_above() {
+        let order: Vec<String> = ["a", "b", "c"].map(str::to_string).into();
+        assert_eq!(banish_neighbor(&order, "b").as_deref(), Some("c"));
+        assert_eq!(banish_neighbor(&order, "c").as_deref(), Some("b"));
+        assert_eq!(banish_neighbor(&["a".to_string()], "a"), None);
+        assert_eq!(banish_neighbor(&order, "gone"), None);
+    }
+
+    #[test]
+    fn new_circle_name_avoids_circles_other_windows_show() {
+        let taken: Vec<String> = ["circle-1", "circle-2"].map(str::to_string).into();
+        assert_eq!(fresh_circle_name(taken.iter()), "circle-3");
+        let gap: Vec<String> = vec!["circle-2".into(), "circle-3".into()];
+        assert_eq!(fresh_circle_name(gap.iter()), "circle-4");
+        assert_eq!(fresh_circle_name(std::iter::empty()), "circle-1");
     }
 
     #[test]

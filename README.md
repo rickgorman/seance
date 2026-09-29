@@ -13,7 +13,10 @@ daemon; the window is disposable.
 
 ![seance](docs/screenshot.png)
 
-**License:** MIT · **Platform:** Linux (Wayland / X11) + macOS thin client · **Status:** 0.26.3
+**License:** MIT · **Platform:** Linux (Wayland / X11) + macOS thin client · **Status:** 0.26.4
+
+Desktop settings (⌘, on macOS) include fonts, terminal colors and iTerm2 palette
+imports, shortcuts, and [separate Seances with optional overlay windows](docs/SEANCES.md).
 
 Release notes: [`CHANGELOG.md`](CHANGELOG.md).
 

@@ -35,9 +35,6 @@ mod tunnel;
 mod webbridge;
 
 use gpui::*;
-use gpui_component::Root;
-
-use crate::app::SeanceApp;
 
 fn main() {
     // Rust ignores SIGPIPE by default, turning `seance ctl … | head` into a
@@ -324,15 +321,26 @@ fn main() {
 
         install_app_menu(cx);
 
-        match boot {
-            Boot::Local => open_main_window(cx),
+        // An Overlay Main (macOS) activates itself after ordering its window
+        // onto the current Space; activating here first could switch Spaces.
+        let activate = match boot {
+            Boot::Local => {
+                open_main_window(cx);
+                app::window_hotkeys::main_boot_activates()
+            }
             Boot::Remote(t) => {
                 adopt_tunnel(t);
                 open_main_window(cx);
+                app::window_hotkeys::main_boot_activates()
             }
-            Boot::Picker(prefill, error) => open_picker_window(prefill, error, cx),
+            Boot::Picker(prefill, error) => {
+                open_picker_window(prefill, error, cx);
+                true
+            }
+        };
+        if activate {
+            cx.activate(true);
         }
-        cx.activate(true);
     });
 }
 
@@ -376,24 +384,10 @@ fn adopt_tunnel(t: tunnel::Tunnel) {
     let _ = ACTIVE_TUNNEL.set(t);
 }
 
+/// Boot/picker Main goes through the same opener as the hotkey, so a
+/// persisted Main Overlay captures the prior app and opens hidden first.
 fn open_main_window(cx: &mut App) {
-    let bounds = Bounds::centered(None, size(px(1480.), px(920.)), cx);
-    cx.open_window(
-        WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
-            titlebar: Some(TitlebarOptions {
-                title: Some("seance".into()),
-                ..Default::default()
-            }),
-            app_id: Some("seance".into()),
-            ..Default::default()
-        },
-        |window, cx| {
-            let view = cx.new(|cx| SeanceApp::new(window, cx));
-            cx.new(|cx| Root::new(view, window, cx))
-        },
-    )
-    .expect("failed to open window");
+    app::window_hotkeys::open_main_window(cx);
 }
 
 fn open_picker_window(prefill: Option<launch::LaunchPref>, error: Option<String>, cx: &mut App) {

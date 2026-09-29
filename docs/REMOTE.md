@@ -53,7 +53,7 @@ stream its contents to the host. `--stdin` works too. `new --cwd`,
 `pad --cat` and `wait --cat` return the host's scratchpad contents.
 
 `~/.config/seance/desktop.json` is **device-local** (font, terminal color
-scheme, in-app shortcuts, macOS window show/hide hotkeys, dedicated workspace
+scheme, in-app shortcuts, macOS window show/hide hotkeys, named Seance
 windows). It never syncs through the daemon; each GUI machine keeps its own copy.
 
 The mac bundle installer links `~/.local/bin/seance` to the installed app,

@@ -592,6 +592,7 @@ impl SeanceApp {
                 // Uniquify against EVERY known circle, not just subscribed
                 // ones — the daemon-owned clock census carries them all.
                 let mut taken: Vec<String> = this.known_workspace_names().into_iter().collect();
+                taken.extend(this.global_workspaces.iter().cloned());
                 taken.extend(this.workspace_activity.keys().cloned());
                 taken.extend(this.workspace_touch.keys().cloned());
                 let taken_refs: Vec<&str> = taken.iter().map(|s| s.as_str()).collect();
